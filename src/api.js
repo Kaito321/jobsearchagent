@@ -39,10 +39,23 @@ export const loadFile   = (type) => api.get(`/files/${type}`).then(r => r.data)
 export const deleteFile = (type) => api.delete(`/files/${type}`)
 
 // ── AI endpoints ──────────────────────────────────────────
-export const checkAIStatus   = () => api.get('/ai/status').then(r => r.data)
-export const matchResume     = (data) => api.post('/ai/match', data).then(r => r.data)
-export const checkLegitimacy = (data) => api.post('/ai/legitimacy', data).then(r => r.data)
-export const checkLayoffs    = (data) => api.post('/ai/layoffs', data).then(r => r.data)
-export const checkPostingAge = (data) => api.post('/ai/posting-age', data).then(r => r.data)
+export const checkAIStatus       = () => api.get('/ai/status').then(r => r.data)
+export const matchResume         = (data) => api.post('/ai/match', data).then(r => r.data)
+export const checkLegitimacy     = (data) => api.post('/ai/legitimacy', data).then(r => r.data)
+export const checkLayoffs        = (data) => api.post('/ai/layoffs', data).then(r => r.data)
+export const checkPostingAge     = (data) => api.post('/ai/posting-age', data).then(r => r.data)
 export const generateCoverLetter = (data) => api.post('/ai/cover-letter', data).then(r => r.data)
-export const extractPdfText  = (data) => api.post('/ai/extract-pdf-text', data).then(r => r.data)
+export const extractPdfText      = (data) => api.post('/ai/extract-pdf-text', data).then(r => r.data)
+export const matchQA             = (data) => api.post('/ai/match-qa', data).then(r => r.data)
+
+// ── Q&A Bank ──────────────────────────────────────────────
+export const getQACategories    = () => api.get('/qa/categories').then(r => r.data)
+export const createQACategory   = (data) => api.post('/qa/categories', data).then(r => r.data)
+export const updateQACategory   = (id, data) => api.patch(`/qa/categories/${id}`, data)
+export const deleteQACategory   = (id) => api.delete(`/qa/categories/${id}`)
+
+export const createQAPair       = (data) => api.post('/qa/pairs', data).then(r => r.data)
+export const updateQAPair       = (id, data) => api.patch(`/qa/pairs/${id}`, data)
+export const deleteQAPair       = (id) => api.delete(`/qa/pairs/${id}`)
+
+export const getQAMatchLog      = (params) => api.get('/qa/match-log', { params }).then(r => r.data)

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import Dashboard from './pages/Dashboard'
 import History from './pages/History'
 import Settings from './pages/Settings'
+import QABank from './pages/QABank'
 import './App.css'
 
 export default function App() {
@@ -18,6 +19,9 @@ export default function App() {
           <button className={page === 'dashboard' ? 'active' : ''} onClick={() => setPage('dashboard')}>
             <i className="ti ti-layout-dashboard" /> Dashboard
           </button>
+          <button className={page === 'qabank' ? 'active' : ''} onClick={() => setPage('qabank')}>
+            <i className="ti ti-messages" /> Q&A Bank
+          </button>
           <button className={page === 'history' ? 'active' : ''} onClick={() => setPage('history')}>
             <i className="ti ti-history" /> History
           </button>
@@ -28,6 +32,7 @@ export default function App() {
       </nav>
       <main className="page-content">
         {page === 'dashboard' && <Dashboard />}
+        {page === 'qabank'    && <QABank />}
         {page === 'history'   && <History />}
         {page === 'settings'  && <Settings />}
       </main>
