@@ -49,13 +49,33 @@ export const extractPdfText      = (data) => api.post('/ai/extract-pdf-text', da
 export const matchQA             = (data) => api.post('/ai/match-qa', data).then(r => r.data)
 
 // ── Q&A Bank ──────────────────────────────────────────────
-export const getQACategories    = () => api.get('/qa/categories').then(r => r.data)
-export const createQACategory   = (data) => api.post('/qa/categories', data).then(r => r.data)
-export const updateQACategory   = (id, data) => api.patch(`/qa/categories/${id}`, data)
-export const deleteQACategory   = (id) => api.delete(`/qa/categories/${id}`)
+export const getQACategories  = () => api.get('/qa/categories').then(r => r.data)
+export const createQACategory = (data) => api.post('/qa/categories', data).then(r => r.data)
+export const updateQACategory = (id, data) => api.patch(`/qa/categories/${id}`, data)
+export const deleteQACategory = (id) => api.delete(`/qa/categories/${id}`)
+export const createQAPair     = (data) => api.post('/qa/pairs', data).then(r => r.data)
+export const updateQAPair     = (id, data) => api.patch(`/qa/pairs/${id}`, data)
+export const deleteQAPair     = (id) => api.delete(`/qa/pairs/${id}`)
+export const getQAMatchLog    = (params) => api.get('/qa/match-log', { params }).then(r => r.data)
 
-export const createQAPair       = (data) => api.post('/qa/pairs', data).then(r => r.data)
-export const updateQAPair       = (id, data) => api.patch(`/qa/pairs/${id}`, data)
-export const deleteQAPair       = (id) => api.delete(`/qa/pairs/${id}`)
+// ── Chrome integration ────────────────────────────────────
+// Send page content scraped by Chrome extension to extract job data
+export const extractJobFromPage    = (data) => api.post('/chrome/extract-job', data).then(r => r.data)
 
-export const getQAMatchLog      = (params) => api.get('/qa/match-log', { params }).then(r => r.data)
+// Send application page content to extract form fields
+export const extractFormFields     = (data) => api.post('/chrome/extract-form', data).then(r => r.data)
+
+// Generate fill instructions for a form using resume + Q&A bank
+export const generateFillInstructions = (data) => api.post('/chrome/generate-fill-instructions', data).then(r => r.data)
+
+// Log chrome session window
+export const createChromeSession   = (data) => api.post('/chrome/sessions', data).then(r => r.data)
+export const updateChromeSession   = (id, data) => api.patch(`/chrome/sessions/${id}`, data)
+
+// Get items that need manual review before submission
+export const getNeedsReview        = (params) => api.get('/chrome/needs-review', { params }).then(r => r.data)
+
+// ── Ready to apply & submission tracking ──────────────────
+export const getReadyJobs          = (params) => api.get('/jobs/ready', { params }).then(r => r.data)
+export const markJobSubmitted      = (id) => api.patch(`/jobs/${id}/submit`).then(r => r.data)
+export const getSessionSummary     = (sessionId) => api.get(`/session-summary/${sessionId}`).then(r => r.data)
