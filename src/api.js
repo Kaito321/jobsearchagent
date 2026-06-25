@@ -1,0 +1,48 @@
+import axios from 'axios'
+
+const api = axios.create({ baseURL: '/api' })
+
+export const getPreferences  = () => api.get('/preferences').then(r => r.data)
+export const savePreferences = (data) => api.post('/preferences', data)
+
+export const getSessions     = () => api.get('/sessions').then(r => r.data)
+export const createSession   = (data) => api.post('/sessions', data).then(r => r.data)
+export const updateSession   = (id, data) => api.patch(`/sessions/${id}`, data)
+
+export const getJobs         = (params) => api.get('/jobs', { params }).then(r => r.data)
+export const getCarryover    = () => api.get('/jobs/carryover').then(r => r.data)
+export const createJob       = (data) => api.post('/jobs', data).then(r => r.data)
+export const updateJob       = (id, data) => api.patch(`/jobs/${id}`, data)
+
+export const getDiscoveryLog = (params) => api.get('/discovery-log', { params }).then(r => r.data)
+export const addDiscoveryLog = (data) => api.post('/discovery-log', data).then(r => r.data)
+
+export const getCoverLetters = (params) => api.get('/cover-letters', { params }).then(r => r.data)
+export const addCoverLetter  = (data) => api.post('/cover-letters', data).then(r => r.data)
+
+export const getStats        = () => api.get('/stats').then(r => r.data)
+
+// ── Stored files ──────────────────────────────────────────
+export const saveFile = (type, file) => new Promise((resolve, reject) => {
+  const reader = new FileReader()
+  reader.onload = async () => {
+    try {
+      const base64 = reader.result.split(',')[1]
+      await api.post(`/files/${type}`, { file_name: file.name, file_data: base64 })
+      resolve({ file_name: file.name, file_data: base64 })
+    } catch (e) { reject(e) }
+  }
+  reader.onerror = reject
+  reader.readAsDataURL(file)
+})
+export const loadFile   = (type) => api.get(`/files/${type}`).then(r => r.data)
+export const deleteFile = (type) => api.delete(`/files/${type}`)
+
+// ── AI endpoints ──────────────────────────────────────────
+export const checkAIStatus   = () => api.get('/ai/status').then(r => r.data)
+export const matchResume     = (data) => api.post('/ai/match', data).then(r => r.data)
+export const checkLegitimacy = (data) => api.post('/ai/legitimacy', data).then(r => r.data)
+export const checkLayoffs    = (data) => api.post('/ai/layoffs', data).then(r => r.data)
+export const checkPostingAge = (data) => api.post('/ai/posting-age', data).then(r => r.data)
+export const generateCoverLetter = (data) => api.post('/ai/cover-letter', data).then(r => r.data)
+export const extractPdfText  = (data) => api.post('/ai/extract-pdf-text', data).then(r => r.data)

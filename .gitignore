@@ -1,0 +1,24 @@
+﻿# Environment variables - never commit these
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+
+# Database - contains your personal data
+jobagent.db
+
+# Build output
+dist/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+#Rider
+.idea/
