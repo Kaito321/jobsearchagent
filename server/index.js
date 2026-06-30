@@ -97,11 +97,60 @@ async function initDB() {
       jobs_filled INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now','localtime'))
     );
+    CREATE TABLE IF NOT EXISTS watchlist (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      company_name TEXT NOT NULL,
+      career_url TEXT,
+      source TEXT DEFAULT 'manual',
+      last_checked_date TEXT,
+      last_checked_at TEXT,
+      jobs_found_last_check INTEGER DEFAULT 0,
+      total_jobs_found INTEGER DEFAULT 0,
+      active INTEGER DEFAULT 1,
+      created_at TEXT DEFAULT (datetime('now','localtime'))
+    );
+    CREATE TABLE IF NOT EXISTS domain_registry (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      domain TEXT UNIQUE NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      reason TEXT,
+      tos_url TEXT,
+      tos_clause TEXT,
+      source TEXT DEFAULT 'auto',
+      visit_count INTEGER DEFAULT 0,
+      jobs_found_total INTEGER DEFAULT 0,
+      first_visited_at TEXT,
+      last_visited_at TEXT,
+      created_at TEXT DEFAULT (datetime('now','localtime'))
+    );
   `)
   runMigrations()
   saveDB()
   seedQAIfEmpty()
+  seedBlacklistIfEmpty()
   console.log(`✅ Database ready: ${DB_PATH}`)
+}
+
+// Seed default blacklist of known job boards with anti-bot terms
+function seedBlacklistIfEmpty() {
+  const count = queryAll('SELECT COUNT(*) as n FROM domain_registry').length
+  if (count > 0) return
+  const knownBlocked = [
+    { domain: 'linkedin.com', reason: 'User Agreement Section 8.2 prohibits bots, scraping, and automated access without authorization.' },
+    { domain: 'indeed.com', reason: 'Terms of Use prohibit robots, spiders, or automated means to access the Services, and prohibit automating the Indeed Apply process.' },
+    { domain: 'glassdoor.com', reason: 'Terms of Use prohibit introducing automated agents or scraping/mining data without express written permission.' },
+    { domain: 'ziprecruiter.com', reason: 'Terms of Service prohibit automated data collection and bot access.' },
+    { domain: 'monster.com', reason: 'Terms of Use prohibit automated scraping and bot access to the platform.' },
+  ]
+  for (const item of knownBlocked) {
+    db.run(
+      `INSERT OR IGNORE INTO domain_registry(domain, status, reason, source, created_at)
+       VALUES(?, 'blacklisted', ?, 'manual', datetime('now','localtime'))`,
+      [item.domain, item.reason]
+    )
+  }
+  saveDB()
+  console.log('✅ Blacklist seeded with known job board restrictions')
 }
 
 // ── Migrations — safely add new columns to existing DBs ──
@@ -123,6 +172,19 @@ function runMigrations() {
       created_at TEXT DEFAULT (datetime('now','localtime'))
     )` },
     // Jobs patch — submitted status (no schema change needed, just a value)
+    // Domain management patch — new tables
+    { table: 'watchlist', column: 'company_name', sql: `CREATE TABLE IF NOT EXISTS watchlist (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, company_name TEXT NOT NULL, career_url TEXT,
+      source TEXT DEFAULT 'manual', last_checked_date TEXT, last_checked_at TEXT,
+      jobs_found_last_check INTEGER DEFAULT 0, total_jobs_found INTEGER DEFAULT 0,
+      active INTEGER DEFAULT 1, created_at TEXT DEFAULT (datetime('now','localtime'))
+    )` },
+    { table: 'domain_registry', column: 'domain', sql: `CREATE TABLE IF NOT EXISTS domain_registry (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, domain TEXT UNIQUE NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending', reason TEXT, tos_url TEXT, tos_clause TEXT,
+      source TEXT DEFAULT 'auto', visit_count INTEGER DEFAULT 0, jobs_found_total INTEGER DEFAULT 0,
+      first_visited_at TEXT, last_visited_at TEXT, created_at TEXT DEFAULT (datetime('now','localtime'))
+    )` },
   ]
 
   // Get existing columns for each table once
@@ -591,6 +653,288 @@ app.get('/api/ai/status', async (req, res) => {
   } catch (e) { res.json({ ok: false, reason: e.message }) }
 })
 
+// ── Domain management (Watchlist / Whitelist / Blacklist / Pending) ──
+
+function extractDomain(url) {
+  try {
+    const u = new URL(url)
+    return u.hostname.replace(/^www\./, '')
+  } catch (_) {
+    return url
+  }
+}
+
+// Extract the registrable root domain (e.g. "jobs.linkedin.com" -> "linkedin.com")
+// Handles common multi-part TLDs (.co.uk, .com.au, etc.) reasonably well.
+function extractRootDomain(hostname) {
+  const parts = hostname.split('.')
+  if (parts.length <= 2) return hostname
+  const multiPartTlds = ['co.uk','com.au','co.jp','com.br','co.in','co.nz','com.mx']
+  const lastTwo = parts.slice(-2).join('.')
+  if (multiPartTlds.includes(lastTwo) && parts.length >= 3) {
+    return parts.slice(-3).join('.')
+  }
+  return parts.slice(-2).join('.')
+}
+
+// Check if a hostname matches a blacklisted domain, including subdomains.
+// e.g. hostname "jobs.linkedin.com" matches blacklist entry "linkedin.com"
+function matchesBlacklistedRoot(hostname, blacklistedDomains) {
+  const root = extractRootDomain(hostname)
+  return blacklistedDomains.find(d => d === hostname || d === root || hostname.endsWith('.' + d))
+}
+
+// Simple https GET used to try fetching a ToS page
+function httpGet(url) {
+  return new Promise((resolve, reject) => {
+    try {
+      const u = new URL(url)
+      const req = https.request({
+        hostname: u.hostname, path: u.pathname + u.search, method: 'GET',
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; JobAgentBot/1.0)' },
+        timeout: 8000
+      }, res => {
+        let data = ''
+        res.on('data', c => data += c)
+        res.on('end', () => resolve({ status: res.statusCode, body: data }))
+      })
+      req.on('error', reject)
+      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')) })
+      req.end()
+    } catch (e) { reject(e) }
+  })
+}
+
+// Try common ToS paths for a domain
+async function findTosPage(domain) {
+  const candidates = [
+    `https://${domain}/terms`, `https://${domain}/terms-of-service`,
+    `https://${domain}/tos`, `https://${domain}/legal/terms`,
+    `https://${domain}/legal`, `https://${domain}/terms-of-use`,
+  ]
+  for (const url of candidates) {
+    try {
+      const res = await httpGet(url)
+      if (res.status === 200 && res.body && res.body.length > 200) {
+        return { url, body: res.body }
+      }
+    } catch (_) { /* try next */ }
+  }
+  return null
+}
+
+// Check a single domain — full pipeline: blacklist (incl. subdomains) → whitelist cache → ToS check
+app.post('/api/domain/check', async (req, res) => {
+  const { url } = req.body
+  const domain = extractDomain(url)
+
+  try {
+    // Exact match first (fastest path)
+    let existing = queryAll('SELECT * FROM domain_registry WHERE domain=?', [domain])[0]
+
+    // No exact match — check if this is a subdomain of any blacklisted root domain
+    if (!existing) {
+      const blacklistedDomains = queryAll("SELECT domain, reason FROM domain_registry WHERE status='blacklisted'")
+      const rootMatch = matchesBlacklistedRoot(domain, blacklistedDomains.map(d => d.domain))
+      if (rootMatch) {
+        const parentEntry = blacklistedDomains.find(d => d.domain === rootMatch)
+        // Register this subdomain too so future lookups are instant (exact match)
+        db.run(
+          `INSERT OR IGNORE INTO domain_registry(domain, status, reason, source, created_at)
+           VALUES(?, 'blacklisted', ?, 'inherited', datetime('now','localtime'))`,
+          [domain, `Subdomain of blacklisted root "${rootMatch}": ${parentEntry?.reason || ''}`]
+        )
+        saveDB()
+        return res.json({
+          domain, status: 'blacklisted', proceed: false,
+          reason: `Subdomain of blacklisted domain "${rootMatch}"`,
+          rootDomain: rootMatch
+        })
+      }
+    }
+
+    // Already known — fast path
+    if (existing) {
+      if (existing.status === 'blacklisted') {
+        return res.json({ domain, status: 'blacklisted', reason: existing.reason, proceed: false })
+      }
+      if (existing.status === 'whitelisted') {
+        db.run('UPDATE domain_registry SET visit_count=visit_count+1, last_visited_at=datetime(\'now\',\'localtime\') WHERE domain=?', [domain])
+        saveDB()
+        return res.json({ domain, status: 'whitelisted', proceed: true })
+      }
+      if (existing.status === 'pending') {
+        return res.json({ domain, status: 'pending', proceed: false, needsApproval: true })
+      }
+    }
+
+    // New domain — try to find ToS
+    const tos = await findTosPage(domain)
+
+    if (!tos) {
+      // Could not find ToS — register as pending, ask user
+      db.run(
+        `INSERT OR IGNORE INTO domain_registry(domain, status, source) VALUES(?, 'pending', 'auto')`,
+        [domain]
+      )
+      saveDB()
+      return res.json({ domain, status: 'pending', proceed: false, needsApproval: true, reason: 'No ToS page found' })
+    }
+
+    // Found ToS — analyze with Claude
+    const result = await claudeRequest(
+      [{ role: 'user', content: `Terms of Service content (truncated):\n${tos.body.replace(/<[^>]+>/g, ' ').slice(0, 6000)}` }],
+      `You are reviewing a website's Terms of Service to determine if it prohibits bots, scraping, or automated access.
+      Respond ONLY with a JSON object:
+      { "prohibits_bots": true|false, "clause": "the specific quote or paraphrase found, or null", "confidence": <0-100> }`
+    )
+    const parsed = parseJSON(result)
+    const prohibits = parsed?.prohibits_bots === true
+
+    if (prohibits) {
+      db.run(
+        `INSERT OR REPLACE INTO domain_registry(domain, status, reason, tos_url, tos_clause, source, created_at)
+         VALUES(?, 'blacklisted', ?, ?, ?, 'auto', datetime('now','localtime'))`,
+        [domain, 'Auto-detected: ToS prohibits bots/scraping', tos.url, parsed.clause || '']
+      )
+      saveDB()
+      return res.json({ domain, status: 'blacklisted', proceed: false, autoDetected: true, reason: parsed.clause })
+    } else {
+      db.run(
+        `INSERT OR REPLACE INTO domain_registry(domain, status, tos_url, source, visit_count, first_visited_at, last_visited_at, created_at)
+         VALUES(?, 'whitelisted', ?, 'auto', 1, datetime('now','localtime'), datetime('now','localtime'), datetime('now','localtime'))`,
+        [domain, tos.url]
+      )
+      saveDB()
+      return res.json({ domain, status: 'whitelisted', proceed: true })
+    }
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// Get all domains by status
+app.get('/api/domain/list', (req, res) => {
+  const { status } = req.query
+  let q = 'SELECT * FROM domain_registry'
+  const params = []
+  if (status) { q += ' WHERE status=?'; params.push(status) }
+  q += ' ORDER BY created_at DESC'
+  res.json(queryAll(q, params))
+})
+
+// Manually add to blacklist
+app.post('/api/domain/blacklist', (req, res) => {
+  const { domain, reason } = req.body
+  // Handle both bare domains ("linkedin.com") and full URLs
+  let clean = domain.trim()
+  if (clean.includes('://')) clean = extractDomain(clean)
+  clean = clean.replace(/^www\./, '').split('/')[0]
+  // Normalize to root domain so subdomain matching works (e.g. "jobs.linkedin.com" -> "linkedin.com")
+  const root = extractRootDomain(clean)
+  db.run(
+    `INSERT OR REPLACE INTO domain_registry(domain, status, reason, source, created_at)
+     VALUES(?, 'blacklisted', ?, 'manual', datetime('now','localtime'))`,
+    [root, reason || 'Manually added']
+  )
+  saveDB()
+  res.json({ ok: true, domain: root })
+})
+
+// Approve a pending domain (user said it's OK to proceed)
+app.post('/api/domain/approve/:domain', (req, res) => {
+  db.run(
+    `UPDATE domain_registry SET status='whitelisted', source='manual', first_visited_at=datetime('now','localtime'), last_visited_at=datetime('now','localtime'), visit_count=1 WHERE domain=?`,
+    [req.params.domain]
+  )
+  saveDB()
+  res.json({ ok: true })
+})
+
+// Reject a pending domain (user said block it)
+app.post('/api/domain/reject/:domain', (req, res) => {
+  const { reason } = req.body
+  db.run(
+    `UPDATE domain_registry SET status='blacklisted', reason=?, source='manual' WHERE domain=?`,
+    [reason || 'Manually blocked by user', req.params.domain]
+  )
+  saveDB()
+  res.json({ ok: true })
+})
+
+// Remove from blacklist (override)
+app.delete('/api/domain/:domain', (req, res) => {
+  db.run('DELETE FROM domain_registry WHERE domain=?', [req.params.domain])
+  saveDB()
+  res.json({ ok: true })
+})
+
+// Increment domain stats when a job is found there
+app.post('/api/domain/record-job/:domain', (req, res) => {
+  db.run('UPDATE domain_registry SET jobs_found_total=jobs_found_total+1 WHERE domain=?', [req.params.domain])
+  saveDB()
+  res.json({ ok: true })
+})
+
+// ── Watchlist ──────────────────────────────────────────────
+app.get('/api/watchlist', (req, res) => {
+  const rows = queryAll('SELECT * FROM watchlist WHERE active=1 ORDER BY created_at DESC')
+  const today = new Date().toLocaleDateString('en-US')
+  res.json(rows.map(r => ({ ...r, checked_today: r.last_checked_date === today })))
+})
+
+app.post('/api/watchlist', (req, res) => {
+  const { company_name, career_url, source } = req.body
+  const info = run(
+    'INSERT INTO watchlist(company_name, career_url, source) VALUES(?,?,?)',
+    [company_name, career_url || null, source || 'manual']
+  )
+  res.json({ id: info.lastInsertRowid })
+})
+
+app.patch('/api/watchlist/:id', (req, res) => {
+  const { career_url, active } = req.body
+  const sets = [], vals = []
+  if (career_url !== undefined) { sets.push('career_url=?'); vals.push(career_url) }
+  if (active !== undefined) { sets.push('active=?'); vals.push(active ? 1 : 0) }
+  if (!sets.length) return res.json({ ok: true })
+  vals.push(req.params.id)
+  db.run(`UPDATE watchlist SET ${sets.join(',')} WHERE id=?`, vals)
+  saveDB(); res.json({ ok: true })
+})
+
+app.delete('/api/watchlist/:id', (req, res) => {
+  db.run('DELETE FROM watchlist WHERE id=?', [req.params.id])
+  saveDB(); res.json({ ok: true })
+})
+
+// Mark a watchlist entry as checked today
+app.post('/api/watchlist/:id/checked', (req, res) => {
+  const { jobs_found } = req.body
+  const today = new Date().toLocaleDateString('en-US')
+  db.run(
+    `UPDATE watchlist SET last_checked_date=?, last_checked_at=datetime('now','localtime'),
+     jobs_found_last_check=?, total_jobs_found=total_jobs_found+? WHERE id=?`,
+    [today, jobs_found || 0, jobs_found || 0, req.params.id]
+  )
+  saveDB(); res.json({ ok: true })
+})
+
+// Auto-discover a career page URL for a company name
+app.post('/api/watchlist/discover', async (req, res) => {
+  const { company_name } = req.body
+  try {
+    const result = await claudeRequest(
+      [{ role: 'user', content: `Company name: ${company_name}` }],
+      `Suggest the most likely career page URL for this company. Consider common patterns:
+      boards.greenhouse.io/[company], jobs.lever.co/[company], [company].com/careers, [company].wd1.myworkdayjobs.com.
+      Respond ONLY with a JSON object: { "suggested_url": "url or null", "confidence": <0-100>, "pattern_used": "greenhouse|lever|workday|direct|unknown" }`
+    )
+    const parsed = parseJSON(result)
+    res.json(parsed || { suggested_url: null, confidence: 0 })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
 // ── Q&A Categories ────────────────────────────────────────
 app.get('/api/qa/categories', (req, res) => {
   const cats = queryAll('SELECT * FROM qa_categories ORDER BY sort_order, created_at')
@@ -794,6 +1138,205 @@ app.get('/api/session-summary/:session_id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
+// ── Claude-driven session endpoints ──────────────────────
+
+// Ping — lets Claude verify the server is reachable before starting
+app.get('/api/session/ping', (req, res) => {
+  res.json({ ok: true, port: PORT, timestamp: new Date().toISOString() })
+})
+
+// Start a Claude-driven session — creates session, returns full prompt for Claude chat
+app.post('/api/session/start-with-claude', async (req, res) => {
+  const { urls, mode, cap, date } = req.body
+  try {
+    // Create session in DB
+    const sessionInfo = run(
+      'INSERT INTO sessions(date, mode, cap) VALUES(?,?,?)',
+      [date || new Date().toLocaleDateString('en-US'), mode || 'manual', cap || 7]
+    )
+    const sessionId = sessionInfo.lastInsertRowid
+
+    // Load resume and cover letter base64
+    const resumeRow = queryAll('SELECT file_name, file_data FROM stored_files WHERE type=?', ['resume'])[0]
+    const clRow     = queryAll('SELECT file_name, file_data FROM stored_files WHERE type=?', ['cover_letter'])[0]
+
+    // Load Q&A bank grouped by category
+    const pairs = queryAll(`
+      SELECT qa_pairs.question, qa_pairs.answer, qa_categories.name as category
+      FROM qa_pairs JOIN qa_categories ON qa_pairs.category_id = qa_categories.id
+      ORDER BY qa_categories.sort_order, qa_pairs.id
+    `)
+    const qaByCategory = {}
+    for (const p of pairs) {
+      if (!qaByCategory[p.category]) qaByCategory[p.category] = []
+      qaByCategory[p.category].push({ q: p.question, a: p.answer })
+    }
+
+    // Load preferences for context
+    const prefRows = queryAll('SELECT key, value FROM preferences')
+    const prefs = {}
+    prefRows.forEach(r => { prefs[r.key] = JSON.parse(r.value) })
+
+    // Build the Claude prompt
+    const prompt = buildClaudePrompt({
+      sessionId,
+      urls,
+      cap,
+      resumeName: resumeRow?.file_name,
+      hasResume: !!resumeRow,
+      hasResumePdf: !!resumeRow?.file_data,
+      clName: clRow?.file_name,
+      hasCL: !!clRow,
+      qaByCategory,
+      prefs,
+      serverPort: PORT
+    })
+
+    res.json({ sessionId, prompt, ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+function buildClaudePrompt({ sessionId, urls, cap, resumeName, hasResume, hasResumePdf, clName, hasCL, qaByCategory, prefs, serverPort }) {
+  const urlList = (urls || []).map((u, i) => `${i + 1}. ${u}`).join('\n')
+  const qaText  = Object.entries(qaByCategory).map(([cat, pairs]) =>
+    `### ${cat}\n${pairs.map(p => `Q: ${p.q}\nA: ${p.a}`).join('\n\n')}`
+  ).join('\n\n')
+
+  return `# Job Application Session Request
+Session ID: ${sessionId}
+Dashboard server: http://localhost:${serverPort}
+
+## What I need you to do
+I am running a job application agent. Please use Claude in Chrome to process each job URL below by:
+
+1. Opening each URL in a **dedicated Chrome window** (keep all tabs in one window)
+2. Reading the full page content to extract the job title, company, description, requirements, and posting date
+3. For each job, POST the extracted data to my local server so the dashboard updates live:
+   \`\`\`
+   POST http://localhost:${serverPort}/api/session/job-update
+   \`\`\`
+4. Running these checks using the Anthropic API (you already have access):
+   - **Resume match** — score 0-100 against the job description (70+ passes)
+   - **Legitimacy** — flag scam signals
+   - **Posting age** — skip if posted more than 30 days ago
+   - **Layoffs** — web search for recent layoffs at the company (last 6 months)
+5. For jobs that pass ALL filters (and within the daily cap of ${cap}):
+   - Open the application page
+   - Fill out the form using my resume and Q&A answers below
+   - Leave the tab open — do NOT submit
+   - POST the result back to my server
+6. After all jobs are processed, POST the session complete status:
+   \`\`\`
+   POST http://localhost:${serverPort}/api/session/complete
+   { "session_id": ${sessionId} }
+   \`\`\`
+
+## Important rules
+- Never submit any application — always leave tabs open for my review
+- If any question asks "are you AI / human / a bot" — leave it blank and log it
+- For multiple choice background check questions (work auth, felony, drug test) — auto-answer from Q&A bank
+- For other multiple choice with confidence ≥85% — auto-select and log
+- For other multiple choice with confidence <85% — flag for my review, still make best guess
+- Post progress updates to my server after each job so my dashboard updates in real time
+
+## Job URLs to process
+${urlList}
+
+## My resume
+File: ${resumeName || 'Not uploaded'}
+${hasResume ? '(Extract text from my resume PDF stored in the dashboard database — call GET http://localhost:' + serverPort + '/api/files/resume to get the base64 PDF)' : '⚠️ No resume uploaded — please ask me to upload one first'}
+
+## My cover letter template
+${hasCL ? `File: ${clName}\n(Call GET http://localhost:${serverPort}/api/files/cover_letter for the base64 PDF)` : 'No cover letter template uploaded — skip cover letter generation'}
+
+## My Q&A bank
+${qaText || 'No Q&A entries yet'}
+
+## API format for posting job updates
+\`\`\`json
+POST http://localhost:${serverPort}/api/session/job-update
+{
+  "session_id": ${sessionId},
+  "url": "the job url",
+  "title": "job title",
+  "company": "company name",
+  "board": "Manual",
+  "score": 85,
+  "filter_match": true,
+  "filter_legit": true,
+  "filter_age": true,
+  "filter_layoffs": true,
+  "status": "ready",
+  "log": ["✓ Score 85%", "✓ Legitimate", "✓ Posted 5 days ago", "✓ No layoffs found"],
+  "cover_letter_text": "full cover letter text or null",
+  "cover_letter_filename": "Company_062326_CL.pdf or null"
+}
+\`\`\`
+`
+}
+
+// Receive live job updates from Claude during a session
+app.post('/api/session/job-update', (req, res) => {
+  const {
+    session_id, url, title, company, board, score,
+    filter_match, filter_legit, filter_age, filter_layoffs,
+    status, log, cover_letter_text, cover_letter_filename, carryover
+  } = req.body
+
+  try {
+    const discovered_at = new Date().toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit' })
+    const info = run(
+      `INSERT INTO jobs(session_id,title,company,board,url,query,discovered_at,score,filter_match,filter_legit,filter_age,filter_layoffs,status,log,carryover)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [session_id, title||'Position', company||'Unknown', board||'Manual', url, '',
+       discovered_at, score||0,
+       filter_match?1:0, filter_legit?1:0, filter_age?1:0,
+       filter_layoffs===null||filter_layoffs===undefined?null:(filter_layoffs?1:0),
+       status||'pending', JSON.stringify(log||[]), carryover?1:0]
+    )
+
+    // Save cover letter if provided
+    if (cover_letter_text && cover_letter_filename) {
+      run(
+        `INSERT INTO cover_letters(session_id,job_id,company,file_name,file_path,board,application_url) VALUES(?,?,?,?,?,?,?)`,
+        [session_id, info.lastInsertRowid, company, cover_letter_filename,
+         cover_letter_filename, board||'Manual', url]
+      )
+    }
+
+    // Update session totals
+    const sessionJobs = queryAll('SELECT * FROM jobs WHERE session_id=?', [session_id])
+    const found   = sessionJobs.length
+    const matched = sessionJobs.filter(j => j.filter_match).length
+    const filled  = sessionJobs.filter(j => j.status === 'ready' || j.status === 'filled').length
+    db.run('UPDATE sessions SET jobs_found=?,jobs_matched=?,jobs_filled=? WHERE id=?',
+      [found, matched, filled, session_id])
+    saveDB()
+
+    res.json({ ok: true, job_id: info.lastInsertRowid })
+  } catch (e) { res.status(500).json({ error: e.message }) }
+})
+
+// Mark session as complete
+app.post('/api/session/complete', (req, res) => {
+  const { session_id } = req.body
+  // Nothing extra needed — just acknowledge so Claude knows it's done
+  res.json({ ok: true, session_id })
+})
+
+// Poll for session jobs — dashboard calls this to get live updates
+app.get('/api/session/jobs/:session_id', (req, res) => {
+  const jobs = queryAll(
+    'SELECT * FROM jobs WHERE session_id=? ORDER BY created_at ASC',
+    [req.params.session_id]
+  )
+  const cls = queryAll(
+    'SELECT * FROM cover_letters WHERE session_id=?',
+    [req.params.session_id]
+  )
+  res.json({ jobs, cover_letters: cls })
+})
+
 // ── Stats ─────────────────────────────────────────────────
 app.get('/api/stats', (req, res) => {
   const n = (sql) => queryAll(sql)[0]?.n ?? 0
@@ -808,6 +1351,10 @@ app.get('/api/stats', (req, res) => {
     totalQAPairs:  n("SELECT COUNT(*) as n FROM qa_pairs"),
     aiDetections:  n("SELECT COUNT(*) as n FROM qa_match_log WHERE is_ai_detection=1"),
     needsReview:   n("SELECT COUNT(*) as n FROM qa_match_log WHERE needs_review=1"),
+    watchlistTotal: n("SELECT COUNT(*) as n FROM watchlist WHERE active=1"),
+    blacklistTotal: n("SELECT COUNT(*) as n FROM domain_registry WHERE status='blacklisted'"),
+    whitelistTotal: n("SELECT COUNT(*) as n FROM domain_registry WHERE status='whitelisted'"),
+    pendingDomains: n("SELECT COUNT(*) as n FROM domain_registry WHERE status='pending'"),
   })
 })
 

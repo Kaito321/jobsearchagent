@@ -79,3 +79,25 @@ export const getNeedsReview        = (params) => api.get('/chrome/needs-review',
 export const getReadyJobs          = (params) => api.get('/jobs/ready', { params }).then(r => r.data)
 export const markJobSubmitted      = (id) => api.patch(`/jobs/${id}/submit`).then(r => r.data)
 export const getSessionSummary     = (sessionId) => api.get(`/session-summary/${sessionId}`).then(r => r.data)
+
+// ── Claude-driven session ─────────────────────────────────
+export const pingServer            = () => api.get('/session/ping').then(r => r.data)
+export const startSessionWithClaude = (data) => api.post('/session/start-with-claude', data).then(r => r.data)
+export const pollSessionJobs       = (sessionId) => api.get(`/session/jobs/${sessionId}`).then(r => r.data)
+
+// ── Domain management ──────────────────────────────────────
+export const checkDomain        = (url) => api.post('/domain/check', { url }).then(r => r.data)
+export const getDomainList      = (status) => api.get('/domain/list', { params: status ? { status } : {} }).then(r => r.data)
+export const blacklistDomain    = (domain, reason) => api.post('/domain/blacklist', { domain, reason }).then(r => r.data)
+export const approveDomain      = (domain) => api.post(`/domain/approve/${domain}`).then(r => r.data)
+export const rejectDomain       = (domain, reason) => api.post(`/domain/reject/${domain}`, { reason }).then(r => r.data)
+export const removeDomain       = (domain) => api.delete(`/domain/${domain}`)
+export const recordDomainJob    = (domain) => api.post(`/domain/record-job/${domain}`).then(r => r.data)
+
+// ── Watchlist ──────────────────────────────────────────────
+export const getWatchlist        = () => api.get('/watchlist').then(r => r.data)
+export const addWatchlistEntry   = (data) => api.post('/watchlist', data).then(r => r.data)
+export const updateWatchlistEntry = (id, data) => api.patch(`/watchlist/${id}`, data)
+export const deleteWatchlistEntry = (id) => api.delete(`/watchlist/${id}`)
+export const markWatchlistChecked = (id, jobsFound) => api.post(`/watchlist/${id}/checked`, { jobs_found: jobsFound }).then(r => r.data)
+export const discoverCareerUrl    = (companyName) => api.post('/watchlist/discover', { company_name: companyName }).then(r => r.data)

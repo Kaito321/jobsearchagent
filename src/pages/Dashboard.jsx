@@ -16,73 +16,6 @@ const STATUS_BADGE = {
   cancelled:  { type: 'danger',  label: 'Cancelled' },
 }
 
-// ── Chrome bridge helpers ─────────────────────────────────
-// These communicate with the Claude in Chrome extension via
-// a shared localStorage key that the extension monitors.
-// The extension reads instructions and writes back results.
-
-const CHROME_REQUEST_KEY  = 'jobagent_chrome_request'
-const CHROME_RESPONSE_KEY = 'jobagent_chrome_response'
-const CHROME_TIMEOUT_MS   = 30000
-
-function sendChromeRequest(type, payload) {
-  return new Promise((resolve, reject) => {
-    const requestId = Date.now().toString()
-    const request = { requestId, type, payload, timestamp: Date.now() }
-
-    // Write request to localStorage for the Chrome extension to pick up
-    localStorage.setItem(CHROME_REQUEST_KEY, JSON.stringify(request))
-
-    const timeout = setTimeout(() => {
-      window.removeEventListener('storage', handler)
-      reject(new Error(`Chrome extension timeout — is the extension connected? (${type})`))
-    }, CHROME_TIMEOUT_MS)
-
-    function handler(e) {
-      if (e.key !== CHROME_RESPONSE_KEY) return
-      try {
-        const response = JSON.parse(e.newValue)
-        if (response.requestId !== requestId) return
-        clearTimeout(timeout)
-        window.removeEventListener('storage', handler)
-        if (response.error) reject(new Error(response.error))
-        else resolve(response.result)
-      } catch (_) {}
-    }
-
-    window.addEventListener('storage', handler)
-  })
-}
-
-// Open a dedicated Chrome window for job processing
-async function openDedicatedWindow() {
-  try {
-    return await sendChromeRequest('open_window', { focused: true })
-  } catch (_) {
-    return null
-  }
-}
-
-// Navigate to a URL in the dedicated window and get page text
-async function scrapePageText(url, windowId) {
-  return await sendChromeRequest('scrape_page', { url, windowId })
-}
-
-// Fill a form field in the dedicated window
-async function fillFormField(instruction, windowId) {
-  return await sendChromeRequest('fill_field', { instruction, windowId })
-}
-
-// Check if Chrome extension is connected
-function checkChromeExtension() {
-  try {
-    localStorage.setItem('jobagent_ping', Date.now().toString())
-    return true
-  } catch (_) {
-    return false
-  }
-}
-
 export default function Dashboard() {
   const [mode, setMode]                   = useState('manual')
   const [tab, setTab]                     = useState('jobs')
@@ -97,27 +30,24 @@ export default function Dashboard() {
   const [prefs, setPrefs]                 = useState({ titles:'', location:'', salary:'', avoid:'' })
   const [boards, setBoards]               = useState(['LinkedIn','Glassdoor','Indeed'])
   const [jobs, setJobs]                   = useState([])
-  const [logRows, setLogRows]             = useState([])
   const [clRows, setClRows]               = useState([])
+  const [logRows, setLogRows]             = useState([])
   const [needsReviewItems, setNeedsReviewItems] = useState([])
   const [stats, setStats]                 = useState({ totalJobs:0, totalFilled:0, totalSkipped:0, totalCLs:0, totalSessions:0, carryover:0 })
   const [carryover, setCarryover]         = useState([])
-  const [running, setRunning]             = useState(false)
   const [sessionId, setSessionId]         = useState(null)
   const [filled, setFilled]               = useState(0)
   const [serverOk, setServerOk]           = useState(false)
   const [aiOk, setAiOk]                   = useState(false)
-  const [chromeOk, setChromeOk]           = useState(false)
-  const [resumeData, setResumeData]       = useState(null)
-  const [clData, setClData]               = useState(null)
-  const [currentStep, setCurrentStep]     = useState('')
-  const [chromeWindowId, setChromeWindowId] = useState(null)
-  const [copySuccess, setCopySuccess]       = useState(false)
-  const [openingTabs, setOpeningTabs]       = useState(false)
-  const [rerunningIndex, setRerunningIndex] = useState(null)
-  const filledRef   = useRef(0)
-  const cancelRef   = useRef(false)
+  const [launching, setLaunching]         = useState(false)
+  const [polling, setPolling]             = useState(false)
+  const [sessionStatus, setSessionStatus] = useState('idle') // idle | waiting | polling | done
+  const [openingTabs, setOpeningTabs]     = useState(false)
+  const [copySuccess, setCopySuccess]     = useState(false)
+  const pollIntervalRef = useRef(null)
+  const jobsRef = useRef([])
 
+  // ── Load data on mount ────────────────────────────────────
   useEffect(() => {
     api.getStats().then(s => { setStats(s); setServerOk(true) }).catch(() => setServerOk(false))
     api.getCarryover().then(rows => setCarryover(rows)).catch(() => {})
@@ -128,17 +58,15 @@ export default function Dashboard() {
       if (p.prefs)  setPrefs(p.prefs)
       if (p.mode)   setMode(p.mode)
     }).catch(() => {})
-
     Promise.all([
       api.loadFile('resume').catch(() => null),
       api.loadFile('cover_letter').catch(() => null)
     ]).then(([resume, cl]) => {
-      if (resume) { setResumeName(resume.file_name); setResumeUpdated(resume.updated_at); setResumeData(resume.file_data) }
-      if (cl)     { setClName(cl.file_name); setClUpdated(cl.updated_at); setClData(cl.file_data) }
+      if (resume) { setResumeName(resume.file_name); setResumeUpdated(resume.updated_at) }
+      if (cl)     { setClName(cl.file_name); setClUpdated(cl.updated_at) }
     }).finally(() => setFilesLoading(false))
-
     api.checkAIStatus().then(s => setAiOk(s.ok)).catch(() => setAiOk(false))
-    setChromeOk(checkChromeExtension())
+    return () => { if (pollIntervalRef.current) clearInterval(pollIntervalRef.current) }
   }, [])
 
   useEffect(() => {
@@ -150,474 +78,77 @@ export default function Dashboard() {
     setStats(s)
   }, [])
 
-  const urlList = urls.trim() ? urls.trim().split('\n').filter(l => l.trim()) : []
-  const canRun  = !!resumeName && (mode === 'auto' || urlList.length > 0) && serverOk && aiOk
-  
+  const urlList   = urls.trim() ? urls.trim().split('\n').filter(l => l.trim()) : []
+  const canLaunch = !!resumeName && (mode === 'auto' || urlList.length > 0) && serverOk
   const readyJobs = jobs.filter(j => j.status === 'ready' || j.status === 'filled')
 
-  // ── Open all ready application tabs in a new Chrome window ─
-  // IMPORTANT: window.open must be called synchronously during the click event.
-  // Any async work before window.open causes Chrome to treat it as a popup and block it.
+  // ── Start polling for live dashboard updates ──────────────
+  function startPolling(sid) {
+    setPolling(true)
+    setSessionStatus('polling')
+    if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
+    pollIntervalRef.current = setInterval(async () => {
+      try {
+        const data = await api.pollSessionJobs(sid)
+        const newJobs = data.jobs || []
+        const newCLs  = data.cover_letters || []
+        setJobs(newJobs)
+        jobsRef.current = newJobs
+        setClRows(newCLs)
+        setFilled(newJobs.filter(j => j.status === 'ready' || j.status === 'filled').length)
+        refreshStats()
+      } catch (_) {}
+    }, 3000)
+  }
+
+  function stopPolling() {
+    if (pollIntervalRef.current) { clearInterval(pollIntervalRef.current); pollIntervalRef.current = null }
+    setPolling(false)
+    setSessionStatus('done')
+    refreshStats()
+  }
+
+  // ── Open all ready tabs ───────────────────────────────────
   function openAllTabs() {
     if (!readyJobs.length) return
     setOpeningTabs(true)
-    const urls = readyJobs.map(j => j.url)
-    // Open all tabs synchronously — Chrome allows this during a direct click event
-    urls.forEach(url => window.open(url, '_blank'))
+    readyJobs.map(j => j.url).forEach(url => window.open(url, '_blank'))
     setOpeningTabs(false)
   }
 
-  // ── Copy session summary for Claude chat ───────────────────
-  async function copyForClaude() {
-    if (!sessionId) return
+  // ── Mark submitted ────────────────────────────────────────
+  async function markSubmitted(jobId, jobIndex) {
     try {
-      const summary = await api.getSessionSummary(sessionId)
-
-      const lines = [
-        `# Job Application Session — ${summary.session_date}`,
-        ``,
-        `## Instructions`,
-        summary.instructions,
-        ``,
-        `## My Resume`,
-        `File: ${summary.resume_file}`,
-        `Cover letter template: ${summary.cover_letter_template}`,
-        ``,
-        `## Applications to Fill (${summary.ready_applications.length} total)`,
-        ...summary.ready_applications.map((j, i) =>
-          `${i+1}. **${j.title}** at **${j.company}**\n   URL: ${j.url}\n   Match score: ${j.score}%${j.cover_letter ? `\n   Cover letter: ${j.cover_letter}` : ''}`
-        ),
-        ``,
-        `## My Q&A Bank`,
-        ...Object.entries(summary.qa_bank).map(([cat, pairs]) =>
-          `### ${cat}\n${pairs.map(p => `Q: ${p.q}\nA: ${p.a}`).join('\n\n')}`
-        ),
-        ``,
-        `## After filling all forms:`,
-        `- Leave every tab open — do NOT submit`,
-        `- Note any AI detection questions that were skipped`,
-        `- Flag any multiple choice answers with low confidence for my review`,
-      ]
-
-      await navigator.clipboard.writeText(lines.join('\n'))
-      setCopySuccess(true)
-      setTimeout(() => setCopySuccess(false), 3000)
-    } catch (e) {
-      alert('Could not copy to clipboard: ' + e.message)
-    }
-  }
-
-  // ── Cancel the running session ────────────────────────────
-  function cancelSession() {
-    cancelRef.current = true
-  }
-
-  // ── Re-run a single cancelled job ─────────────────────────
-  async function rerunJob(jobIndex) {
-    const job = jobs[jobIndex]
-    if (!job) return
-    setRerunningIndex(jobIndex)
-    cancelRef.current = false
-    // Reset the job to processing state
-    updateJob(jobIndex, {
-      status: 'processing',
-      log: ['→ Re-running job…'],
-      filter_match: null, filter_legit: null, filter_age: null, filter_layoffs: null,
-      score: 0, cl: null
-    })
-    try {
-      await processJob(job.url, sessionId, filledRef.current, jobIndex, chromeWindowId)
-    } finally {
-      setRerunningIndex(null)
-    }
-  }
-  const jobsRef = useRef([])
-  const updateJob = useCallback((index, patch) => {
-    setJobs(prev => {
-      const next = [...prev]
-      const idx  = index >= 0 ? index : next.length - 1
-      next[idx]  = { ...next[idx], ...patch }
-      jobsRef.current = next
-      return next
-    })
-  }, [])
-
-  // ── Mark a job as submitted ────────────────────────────────
-  async function markSubmitted(jobIndex) {
-    const job = jobs[jobIndex]
-    if (!job?.id) {
-      updateJob(jobIndex, { status: 'submitted' })
-      return
-    }
-    try {
-      await api.markJobSubmitted(job.id)
-      updateJob(jobIndex, { status: 'submitted' })
+      if (jobId) await api.markJobSubmitted(jobId)
+      setJobs(prev => {
+        const next = [...prev]
+        next[jobIndex] = { ...next[jobIndex], status: 'submitted' }
+        return next
+      })
       refreshStats()
-    } catch (_) {
-      updateJob(jobIndex, { status: 'submitted' })
-    }
-  }
-
-  // ── Process a single job URL ──────────────────────────────
-  async function processJob(jobUrl, sid, localFilled, jobIndex, windowId) {
-    const ts = new Date().toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit' })
-    const jobLog = []
-
-    const update = (patch) => updateJob(jobIndex, patch)
-
-    // Check if cancelled before starting
-    if (cancelRef.current) {
-      update({ status: 'cancelled', log: ['✗ Cancelled before processing'] })
-      return { passed: false, filled: localFilled, cancelled: true }
-    }
-
-    try {
-      // ── Step 1: Scrape job page via Chrome ──────────────────
-      setCurrentStep(`Opening job page…`)
-      update({ log: ['→ Opening job page in Chrome…'] })
-
-      let pageText = ''
-      let jobData  = {}
-
-      if (windowId) {
-        try {
-          const scraped = await scrapePageText(jobUrl, windowId)
-          pageText = scraped?.text || ''
-          update({ log: ['→ Extracting job details…'] })
-          jobData = await api.extractJobFromPage({ page_text: pageText, url: jobUrl })
-        } catch (e) {
-          // Chrome scraping failed — fall back gracefully
-          jobLog.push(`⚠ Chrome scraping failed: ${e.message}`)
-          jobLog.push('→ Continuing with URL-only matching')
-          pageText = `Job posting URL: ${jobUrl}`
-          jobData  = {
-            title:   'Position',
-            company: new URL(jobUrl).hostname.replace('www.','').split('.')[0],
-            description: pageText,
-            within_30_days: null
-          }
-        }
-      } else {
-        // No Chrome window — URL only mode
-        jobLog.push('⚠ Chrome extension not available — using URL only')
-        pageText = `Job posting URL: ${jobUrl}`
-        jobData  = {
-          title:   'Position',
-          company: new URL(jobUrl).hostname.replace('www.','').split('.')[0],
-          description: pageText,
-          within_30_days: null
-        }
-      }
-
-      const jobTitle      = jobData.title || 'Position'
-      const company       = jobData.company || new URL(jobUrl).hostname.replace('www.','').split('.')[0]
-      const jobDesc       = jobData.description || pageText
-      const board         = mode === 'auto' ? 'Searching' : 'Manual'
-
-      update({ title: jobTitle, company, log: ['→ Scoring resume match…'] })
-
-      // ── Step 2: Extract resume text ─────────────────────────
-      setCurrentStep(`Scoring match for ${company}…`)
-      let resumeText = ''
-      if (resumeData) {
-        const extracted = await api.extractPdfText({ base64_pdf: resumeData, type: 'resume' })
-        resumeText = extracted.text
-      }
-
-      // ── Step 3: Resume match ────────────────────────────────
-      const matchResult = await api.matchResume({ resume_text: resumeText, job_description: jobDesc, job_title: jobTitle, company })
-      const score    = matchResult.score ?? 0
-      const matchPass = score >= 70
-
-      // Cancel check after resume match
-      if (cancelRef.current) {
-        jobLog.push('✗ Session cancelled')
-        update({ status:'cancelled', log: jobLog, score, filter_match: matchPass?1:0 })
-        return { passed:false, filled:localFilled, cancelled:true }
-      }
-
-      jobLog.push(matchPass ? `✓ Score ${score}% — above threshold` : `✗ Score ${score}% — below 70% threshold`)
-      if (matchResult.strengths?.length) jobLog.push(`  Strengths: ${matchResult.strengths.slice(0,2).join(', ')}`)
-      if (!matchPass && matchResult.missing?.length) jobLog.push(`  Missing: ${matchResult.missing.slice(0,2).join(', ')}`)
-
-      update({ score, filter_match: matchPass?1:0, log: [...jobLog, '→ Checking legitimacy…'] })
-
-      if (!matchPass) {
-        update({ status:'skip', log: jobLog })
-        await api.createJob({ session_id:sid, title:jobTitle, company, board, url:jobUrl, query:'', discovered_at:ts, score, filter_match:0, filter_legit:null, filter_age:null, filter_layoffs:null, status:'skip', log:jobLog, carryover:0 })
-        return { passed:false, filled:localFilled }
-      }
-
-      // ── Step 4: Legitimacy check ────────────────────────────
-      setCurrentStep(`Checking legitimacy for ${company}…`)
-      const legitResult = await api.checkLegitimacy({ job_description:jobDesc, job_title:jobTitle, company, url:jobUrl })
-      const legitPass = legitResult.legitimate === true
-
-      // Cancel check after legitimacy
-      if (cancelRef.current) {
-        jobLog.push('✗ Session cancelled')
-        update({ status:'cancelled', log: jobLog, filter_legit: legitPass?1:0 })
-        return { passed:false, filled:localFilled, cancelled:true }
-      }
-
-      jobLog.push(legitPass
-        ? `✓ Legitimate posting (${legitResult.confidence}% confidence)`
-        : `✗ Scam signals: ${legitResult.flags?.join(', ') || legitResult.reason}`)
-      update({ filter_legit:legitPass?1:0, log:[...jobLog,'→ Checking posting age…'] })
-
-      if (!legitPass) {
-        update({ status:'skip', log:jobLog })
-        await api.createJob({ session_id:sid, title:jobTitle, company, board, url:jobUrl, query:'', discovered_at:ts, score, filter_match:1, filter_legit:0, filter_age:null, filter_layoffs:null, status:'skip', log:jobLog, carryover:0 })
-        return { passed:false, filled:localFilled }
-      }
-
-      // ── Step 5: Posting age ─────────────────────────────────
-      setCurrentStep(`Checking posting age for ${company}…`)
-      let agePass = true
-      if (jobData.within_30_days === false) {
-        agePass = false
-        jobLog.push(`✗ Posted ${jobData.days_old} days ago — exceeds 30-day limit`)
-      } else if (jobData.within_30_days === true) {
-        jobLog.push(`✓ ${jobData.posted_date ? `Posted ${jobData.posted_date}` : 'Posting age OK'}`)
-      } else {
-        const ageResult = await api.checkPostingAge({ job_description:jobDesc, url:jobUrl })
-        agePass = ageResult.within_30_days !== false
-        jobLog.push(agePass
-          ? `✓ ${ageResult.posted_date ? `Posted ${ageResult.posted_date}` : 'Posting age OK'}`
-          : `✗ Posted ${ageResult.days_old} days ago — exceeds 30-day limit`)
-      }
-
-      // Cancel check after age
-      if (cancelRef.current) {
-        jobLog.push('✗ Session cancelled')
-        update({ status:'cancelled', log: jobLog, filter_age: agePass?1:0 })
-        return { passed:false, filled:localFilled, cancelled:true }
-      }
-
-      update({ filter_age:agePass?1:0, log:[...jobLog,'→ Checking for recent layoffs…'] })
-
-      if (!agePass) {
-        update({ status:'skip', log:jobLog })
-        await api.createJob({ session_id:sid, title:jobTitle, company, board, url:jobUrl, query:'', discovered_at:ts, score, filter_match:1, filter_legit:1, filter_age:0, filter_layoffs:null, status:'skip', log:jobLog, carryover:0 })
-        return { passed:false, filled:localFilled }
-      }
-
-      // ── Step 6: Layoff check ────────────────────────────────
-      setCurrentStep(`Scanning layoff news for ${company}…`)
-      const layoffResult = await api.checkLayoffs({ company })
-      const layoffPass   = !layoffResult.had_layoffs
-
-      // Cancel check after layoffs
-      if (cancelRef.current) {
-        jobLog.push('✗ Session cancelled')
-        update({ status:'cancelled', log: jobLog, filter_layoffs: layoffPass?1:0 })
-        return { passed:false, filled:localFilled, cancelled:true }
-      }
-
-      jobLog.push(layoffPass ? `✓ No recent layoffs found` : `✗ Layoff news found: ${layoffResult.details}`)
-      update({ filter_layoffs:layoffPass?1:0, log:[...jobLog] })
-
-      if (!layoffPass) {
-        update({ status:'skip', log:jobLog })
-        await api.createJob({ session_id:sid, title:jobTitle, company, board, url:jobUrl, query:'', discovered_at:ts, score, filter_match:1, filter_legit:1, filter_age:1, filter_layoffs:0, status:'skip', log:jobLog, carryover:0 })
-        return { passed:false, filled:localFilled }
-      }
-
-      // ── Step 7: Daily cap check ─────────────────────────────
-      if (localFilled >= cap) {
-        jobLog.push(`⏸ Daily cap of ${cap} reached — added to carry-over queue`)
-        update({ status:'carryover', log:jobLog, filter_layoffs:1 })
-        await api.createJob({ session_id:sid, title:jobTitle, company, board, url:jobUrl, query:'', discovered_at:ts, score, filter_match:1, filter_legit:1, filter_age:1, filter_layoffs:1, status:'carryover', log:jobLog, carryover:1 })
-        return { passed:true, filled:localFilled }
-      }
-
-      // ── Step 8: Generate cover letter ───────────────────────
-      let clInfo = null
-      if (clData) {
-        setCurrentStep(`Generating cover letter for ${company}…`)
-        jobLog.push('→ Generating customized cover letter…')
-        update({ log:[...jobLog] })
-        try {
-          const clExtracted = await api.extractPdfText({ base64_pdf:clData, type:'cover_letter' })
-          const clResult    = await api.generateCoverLetter({ template_text:clExtracted.text, resume_text:resumeText, job_description:jobDesc, job_title:jobTitle, company })
-          const dateStr     = new Date().toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'2-digit'}).replace(/\//g,'')
-          const companyClean = company.charAt(0).toUpperCase() + company.slice(1)
-          const fileName    = `${companyClean}_${dateStr}_CL.pdf`
-          const filePath    = folder ? `${folder}\\${fileName}` : fileName
-          clInfo = { company, file_name:fileName, file_path:filePath, content:clResult.cover_letter }
-          jobLog.push(`✓ Cover letter generated: ${fileName}`)
-        } catch (e) {
-          jobLog.push(`⚠ Cover letter generation failed: ${e.message}`)
-        }
-      }
-
-      // ── Step 9: Save job to DB ──────────────────────────────
-      localFilled++
-      filledRef.current = localFilled
-      setFilled(localFilled)
-
-      const jobRecord = await api.createJob({ session_id:sid, title:jobTitle, company, board, url:jobUrl, query:'', discovered_at:ts, score, filter_match:1, filter_legit:1, filter_age:1, filter_layoffs:1, status:'ready', log:jobLog, carryover:0 })
-
-      if (clInfo) {
-        await api.addCoverLetter({ session_id:sid, job_id:jobRecord.id, company, file_name:clInfo.file_name, file_path:clInfo.file_path, board, application_url:jobUrl })
-        setClRows(prev => [...prev, { ...clInfo, board, application_url:jobUrl, created_at:new Date().toLocaleString() }])
-      }
-
-      // ── Step 10: Open application page + fill form ──────────
-      if (windowId) {
-        setCurrentStep(`Filling application for ${company}…`)
-        jobLog.push('→ Opening application page in Chrome…')
-        update({ log:[...jobLog] })
-
-        try {
-          // Navigate to apply URL (may differ from job listing URL)
-          const applyUrl = jobData.apply_url || jobUrl
-          const appPage  = await scrapePageText(applyUrl, windowId)
-          const formData = await api.extractFormFields({ page_text:appPage?.text||'', url:applyUrl })
-
-          jobLog.push(`→ Found ${formData.fields?.length || 0} form fields — generating fill instructions…`)
-          update({ log:[...jobLog] })
-
-          const fillResult = await api.generateFillInstructions({
-            form_fields: formData.fields,
-            resume_text: resumeText,
-            job_title:   jobTitle,
-            company,
-            session_id:  sid,
-            job_id:      jobRecord.id
-          })
-
-          // Execute fill instructions in Chrome
-          let filledCount = 0
-          let skippedCount = 0
-          let reviewCount = 0
-
-          for (const inst of (fillResult.instructions || [])) {
-            if (inst.skip) {
-              skippedCount++
-              if (inst.is_ai_detection) {
-                jobLog.push(`⚠ AI detection question skipped: "${inst.field_label}"`)
-              }
-              continue
-            }
-            try {
-              await fillFormField(inst, windowId)
-              filledCount++
-            } catch (_) {
-              skippedCount++
-            }
-            if (inst.needs_review) reviewCount++
-          }
-
-          jobLog.push(`✓ Filled ${filledCount} fields — ${skippedCount} skipped`)
-          if (reviewCount > 0) jobLog.push(`⚠ ${reviewCount} field${reviewCount!==1?'s':''} need review before submitting`)
-          if (fillResult.summary?.ai_detections > 0) jobLog.push(`⚠ ${fillResult.summary.ai_detections} AI detection question${fillResult.summary.ai_detections!==1?'s':''} left blank`)
-          jobLog.push('✋ Application tab left open — review and submit manually')
-
-          // Refresh needs-review items
-          if (reviewCount > 0) {
-            api.getNeedsReview({ session_id: sid }).then(setNeedsReviewItems).catch(() => {})
-          }
-
-        } catch (e) {
-          jobLog.push(`⚠ Form filling failed: ${e.message}`)
-          jobLog.push('→ Tab left open — please fill manually')
-        }
-      } else {
-        jobLog.push('✓ All filters passed — open URL to apply manually')
-      }
-
-      update({ status:'ready', log:jobLog, filter_layoffs:1, cl:clInfo })
-      return { passed:true, filled:localFilled }
-
-    } catch (e) {
-      jobLog.push(`✗ Error: ${e.message}`)
-      updateJob(jobIndex, { status:'skip', log:jobLog })
-      return { passed:false, filled:localFilled }
-    }
-  }
-
-  // ── Run session ───────────────────────────────────────────
-  async function runAgent() {
-    if (running) return
-    setRunning(true)
-    setJobs([]); setLogRows([]); setClRows([]); setFilled(0); setNeedsReviewItems([])
-    filledRef.current = 0
-    jobsRef.current   = []
-    setCurrentStep('Starting session…')
-
-    const today = new Date().toLocaleDateString('en-US')
-    let sid = null
-    try {
-      const s = await api.createSession({ date:today, mode, cap })
-      sid = s.id
-      setSessionId(sid)
     } catch (_) {}
+  }
 
-    // Open dedicated Chrome window
-    let windowId = null
-    if (chromeOk) {
-      setCurrentStep('Opening dedicated Chrome window…')
-      try {
-        const win = await openDedicatedWindow()
-        windowId = win?.windowId || null
-        setChromeWindowId(windowId)
-        if (windowId) {
-          await api.createChromeSession({ session_id:sid, window_id:windowId })
-        }
-      } catch (e) {
-        setCurrentStep('Chrome window failed — continuing without browser automation')
-      }
-    }
-
-    const jobUrls = mode === 'manual' ? urlList : []
-    let localFilled = 0, found = 0, matched = 0
-
-    // Pre-populate job list with pending entries
-    const pending = jobUrls.map(url => ({
-      title:'Pending…', company:'…', board:'Manual', url, query:'',
-      discovered_at: new Date().toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'}),
-      score:0, filter_match:null, filter_legit:null, filter_age:null, filter_layoffs:null,
-      status:'pending', log:['Waiting to process…'], cl:null
-    }))
-    setJobs(pending)
-    jobsRef.current = pending
-
-    cancelRef.current = false
-
-    for (let i = 0; i < jobUrls.length; i++) {
-      // Mark current job as processing
-      updateJob(i, { status:'processing', log:['→ Fetching job posting…'] })
-      found++
-      const result = await processJob(jobUrls[i], sid, localFilled, i, windowId)
-      localFilled = result.filled
-      if (result.passed) matched++
-
-      // If cancelled, mark all remaining pending jobs as cancelled
-      if (cancelRef.current) {
-        for (let j = i + 1; j < jobUrls.length; j++) {
-          updateJob(j, {
-            status: 'cancelled',
-            log: ['✗ Session was cancelled before this job was processed']
-          })
-        }
-        break
-      }
-    }
-
-    cancelRef.current = false
-
-    if (sid) {
-      try { await api.updateSession(sid, { jobs_found:found, jobs_matched:matched, jobs_filled:localFilled }) } catch (_) {}
-    }
-
-    setCurrentStep('')
-    setRunning(false)
-    refreshStats()
-
-    // Load final needs-review items
-    if (sid) {
-      api.getNeedsReview({ session_id:sid }).then(setNeedsReviewItems).catch(() => {})
+  // ── Launch session with Claude ────────────────────────────
+  async function launchWithClaude() {
+    if (launching) return
+    setLaunching(true)
+    setJobs([]); setClRows([]); setFilled(0)
+    setSessionStatus('waiting')
+    try {
+      const result = await api.startSessionWithClaude({
+        urls: urlList, mode, cap,
+        date: new Date().toLocaleDateString('en-US')
+      })
+      setSessionId(result.sessionId)
+      await navigator.clipboard.writeText(result.prompt)
+      window.open('https://claude.ai', '_blank')
+      startPolling(result.sessionId)
+    } catch (e) {
+      alert('Failed to start session: ' + e.message)
+      setSessionStatus('idle')
+    } finally {
+      setLaunching(false)
     }
   }
 
@@ -635,30 +166,52 @@ export default function Dashboard() {
           {!serverOk && <Badge type="danger"><i className="ti ti-alert-circle" /> Server offline</Badge>}
           {serverOk && !aiOk && <Badge type="warning"><i className="ti ti-alert-triangle" /> Add API key to .env</Badge>}
           {serverOk && aiOk && <Badge type="success"><i className="ti ti-circle-check" /> Claude API connected</Badge>}
-          {chromeOk
-            ? <Badge type="info"><i className="ti ti-brand-chrome" /> Chrome connected</Badge>
-            : <Badge type="neutral"><i className="ti ti-brand-chrome" /> Chrome not detected</Badge>
-          }
+          {polling && <Badge type="info"><Spinner size={11} /> Waiting for Claude…</Badge>}
+          {sessionStatus === 'done' && <Badge type="success"><i className="ti ti-circle-check" /> Session complete</Badge>}
           <div className="mode-toggle" role="group">
             <button className={mode==='manual'?'active':''} onClick={() => setMode('manual')}>Manual</button>
             <button className={mode==='auto'?'active':''} onClick={() => setMode('auto')}>Autonomous</button>
           </div>
-          {running ? (
-            <div style={{ display:'flex', gap:8 }}>
-              <Button variant="secondary" disabled>
-                <Spinner size={13} /> {currentStep||'Running…'}
-              </Button>
-              <Button variant="danger" onClick={cancelSession}>
-                <i className="ti ti-player-stop" style={{ fontSize:13 }} /> Cancel
-              </Button>
-            </div>
+          {polling ? (
+            <Button variant="secondary" onClick={stopPolling} size="md">
+              <i className="ti ti-player-stop" style={{ fontSize:13 }} /> Stop polling
+            </Button>
           ) : (
-            <Button onClick={runAgent} disabled={!canRun} variant="primary">
-              <i className="ti ti-player-play" /> Start session
+            <Button onClick={launchWithClaude} disabled={!canLaunch || launching} variant="primary">
+              {launching
+                ? <><Spinner size={13} /> Launching…</>
+                : <><i className="ti ti-brand-claude" /> Start session with Claude</>}
             </Button>
           )}
         </div>
       </div>
+
+      {/* Waiting for Claude banner */}
+      {sessionStatus === 'waiting' && (
+        <div className="carryover-banner" style={{ background:'var(--blue-bg)', borderColor:'rgba(96,165,250,.2)', marginBottom:16 }}>
+          <Spinner size={16} />
+          <div style={{ flex:1 }}>
+            <div style={{ fontWeight:500, color:'var(--blue)' }}>Session prompt copied to clipboard — Claude.ai is opening</div>
+            <div style={{ fontSize:12, color:'var(--text2)', marginTop:2 }}>
+              Paste the prompt into the Claude chat and send it. This dashboard will update live as Claude processes each job.
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Polling banner */}
+      {sessionStatus === 'polling' && jobs.length === 0 && (
+        <div className="carryover-banner" style={{ background:'var(--blue-bg)', borderColor:'rgba(96,165,250,.2)', marginBottom:16 }}>
+          <Spinner size={16} />
+          <div style={{ flex:1 }}>
+            <div style={{ fontWeight:500, color:'var(--blue)' }}>Waiting for Claude to start processing jobs…</div>
+            <div style={{ fontSize:12, color:'var(--text2)', marginTop:2 }}>
+              Dashboard updates every 3 seconds. Make sure you pasted and sent the prompt in Claude.ai.
+            </div>
+          </div>
+          <Button size="sm" variant="secondary" onClick={stopPolling}>Stop waiting</Button>
+        </div>
+      )}
 
       {/* Carry-over banner */}
       {carryover.length > 0 && (
@@ -694,9 +247,12 @@ export default function Dashboard() {
               subLabel={resumeUpdated ? `Saved ${resumeUpdated}` : null}
               onFile={async f => {
                 setResumeName(f.name)
-                try { const saved = await api.saveFile('resume', f); setResumeData(saved.file_data); setResumeUpdated(new Date().toLocaleString()) } catch (_) {}
+                try { await api.saveFile('resume', f); setResumeUpdated(new Date().toLocaleString()) } catch (_) {}
               }}
-              onClear={async () => { setResumeName(''); setResumeUpdated(''); setResumeData(null); try { await api.deleteFile('resume') } catch (_) {} }}
+              onClear={async () => {
+                setResumeName(''); setResumeUpdated('')
+                try { await api.deleteFile('resume') } catch (_) {}
+              }}
             />
           </div>
 
@@ -708,9 +264,12 @@ export default function Dashboard() {
               subLabel={clUpdated ? `Saved ${clUpdated}` : null}
               onFile={async f => {
                 setClName(f.name)
-                try { const saved = await api.saveFile('cover_letter', f); setClData(saved.file_data); setClUpdated(new Date().toLocaleString()) } catch (_) {}
+                try { await api.saveFile('cover_letter', f); setClUpdated(new Date().toLocaleString()) } catch (_) {}
               }}
-              onClear={async () => { setClName(''); setClUpdated(''); setClData(null); try { await api.deleteFile('cover_letter') } catch (_) {} }}
+              onClear={async () => {
+                setClName(''); setClUpdated('')
+                try { await api.deleteFile('cover_letter') } catch (_) {}
+              }}
             />
             <div style={{ marginTop:10 }}>
               <div style={{ fontSize:12, color:'var(--text2)', marginBottom:6 }}>Cover letter save folder</div>
@@ -798,7 +357,25 @@ export default function Dashboard() {
             </div>
           </Card>
 
-          {/* Ready to Apply panel — shown when session has results */}
+          {/* How to use — shown when no session running */}
+          {sessionStatus === 'idle' && jobs.length === 0 && (
+            <Card style={{ padding:'16px 18px' }}>
+              <div style={{ fontWeight:500, fontSize:13, marginBottom:10 }}>
+                <i className="ti ti-info-circle" style={{ color:'var(--blue)', marginRight:6 }} />
+                How to start a session
+              </div>
+              <div style={{ display:'flex', flexDirection:'column', gap:8, fontSize:12, color:'var(--text2)', lineHeight:1.7 }}>
+                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>1.</span> Upload your resume and cover letter template in the sidebar</div>
+                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>2.</span> Paste your job URLs (one per line) in the sidebar</div>
+                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>3.</span> Click <strong>Start session with Claude</strong> — this copies a prompt and opens claude.ai</div>
+                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>4.</span> Paste the prompt into Claude chat and send it</div>
+                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>5.</span> Watch this dashboard update live as Claude processes each job</div>
+                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>6.</span> When done, review the Ready to Apply panel and open all tabs</div>
+              </div>
+            </Card>
+          )}
+
+          {/* Ready to Apply panel */}
           {readyJobs.length > 0 && (
             <Card style={{ padding:'14px 18px', border:'1px solid rgba(52,211,153,.25)', background:'var(--green-bg)' }}>
               <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12 }}>
@@ -808,21 +385,14 @@ export default function Dashboard() {
                     {readyJobs.length} application{readyJobs.length!==1?'s':''} ready to apply
                   </div>
                   <div style={{ fontSize:12, color:'var(--text2)', marginTop:3 }}>
-                    Open all tabs in Chrome, then copy your session summary to paste into Claude chat for auto-fill
+                    Open all tabs, then come back to this chat and say "Fill all open application tabs"
                   </div>
                 </div>
-                <div style={{ display:'flex', gap:8, flexShrink:0 }}>
-                  <Button size="sm" variant="secondary" onClick={openAllTabs} disabled={openingTabs}>
-                    {openingTabs
-                      ? <><Spinner size={12} /> Opening…</>
-                      : <><i className="ti ti-external-link" style={{ fontSize:12 }} /> Open all tabs</>}
-                  </Button>
-                  <Button size="sm" variant="primary" onClick={copyForClaude} disabled={!sessionId}>
-                    {copySuccess
-                      ? <><i className="ti ti-check" style={{ fontSize:12 }} /> Copied!</>
-                      : <><i className="ti ti-clipboard" style={{ fontSize:12 }} /> Copy for Claude</>}
-                  </Button>
-                </div>
+                <Button size="sm" variant="secondary" onClick={openAllTabs} disabled={openingTabs}>
+                  {openingTabs
+                    ? <><Spinner size={12} /> Opening…</>
+                    : <><i className="ti ti-external-link" style={{ fontSize:12 }} /> Open all tabs</>}
+                </Button>
               </div>
               <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
                 {readyJobs.map((j, i) => {
@@ -833,10 +403,9 @@ export default function Dashboard() {
                         <div style={{ fontWeight:500, fontSize:13, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{j.title}</div>
                         <div style={{ fontSize:11, color:'var(--text2)' }}>{j.company} · <span style={{ color:j.score>=80?'var(--green)':j.score>=70?'var(--amber)':'var(--red)', fontWeight:600 }}>{j.score}%</span></div>
                       </div>
-                      {j.cl && <Badge type="info"><i className="ti ti-file-text" style={{ fontSize:10 }} /> CL</Badge>}
                       {j.status === 'submitted'
                         ? <Badge type="success"><i className="ti ti-send" style={{ fontSize:10 }} /> Submitted</Badge>
-                        : <Button size="sm" variant="secondary" onClick={() => markSubmitted(globalIdx)}>
+                        : <Button size="sm" variant="secondary" onClick={() => markSubmitted(j.id, globalIdx)}>
                             <i className="ti ti-send" style={{ fontSize:11 }} /> Mark submitted
                           </Button>
                       }
@@ -846,15 +415,6 @@ export default function Dashboard() {
                     </div>
                   )
                 })}
-              </div>
-              {/* How to use Claude chat instructions */}
-              <div style={{ marginTop:12, padding:'10px 12px', background:'var(--bg3)', borderRadius:'var(--radius)', fontSize:12, color:'var(--text2)', lineHeight:1.6 }}>
-                <span style={{ fontWeight:500, color:'var(--text)' }}>How to use: </span>
-                1. Click <strong>Open all tabs</strong> to open each application in Chrome &nbsp;·&nbsp;
-                2. Click <strong>Copy for Claude</strong> to copy your session summary &nbsp;·&nbsp;
-                3. Go to <a href="https://claude.ai" target="_blank" rel="noreferrer" style={{ color:'var(--blue)' }}>claude.ai</a> and paste it &nbsp;·&nbsp;
-                4. Claude will fill all open tabs using your resume and Q&A answers &nbsp;·&nbsp;
-                5. Come back here and mark each one submitted after you review and send
               </div>
             </Card>
           )}
@@ -877,13 +437,14 @@ export default function Dashboard() {
                   <i className="ti ti-search" style={{ fontSize:32, opacity:.3 }} />
                   <div style={{ fontSize:14, fontWeight:500, marginTop:10 }}>No jobs yet</div>
                   <div style={{ fontSize:12, color:'var(--text3)', marginTop:4 }}>
-                    {!resumeName ? 'Upload your resume to get started' : 'Paste job URLs and start a session'}
+                    {!resumeName ? 'Upload your resume to get started' : 'Start a session with Claude to process jobs'}
                   </div>
                 </div>
               ) : (
                 <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
                   {jobs.map((j, i) => {
                     const badge = STATUS_BADGE[j.status] || STATUS_BADGE.pending
+                    const log   = typeof j.log === 'string' ? JSON.parse(j.log) : (j.log || [])
                     return (
                       <Card key={i}>
                         <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:10 }}>
@@ -896,7 +457,7 @@ export default function Dashboard() {
                             </div>
                           </div>
                           <div style={{ display:'flex', alignItems:'center', gap:8, flexShrink:0 }}>
-                            {(j.status==='processing'||j.status==='pending') && <Spinner size={13} />}
+                            {j.status==='processing' && <Spinner size={13} />}
                             <Badge type={badge.type}>{badge.label}</Badge>
                             {j.score > 0 && (
                               <span style={{ fontSize:14, fontWeight:600, color:j.score>=80?'var(--green)':j.score>=70?'var(--amber)':'var(--red)' }}>{j.score}%</span>
@@ -908,28 +469,12 @@ export default function Dashboard() {
                           <FilterPill pass={j.filter_legit}   label="Legit"      />
                           <FilterPill pass={j.filter_age}     label="Age"        />
                           <FilterPill pass={j.filter_layoffs} label="No layoffs" />
-                          {j.cl && <Badge type="info"><i className="ti ti-file-text" style={{ fontSize:11 }} /> {j.cl.file_name}</Badge>}
                         </div>
                         <div style={{ marginTop:10, display:'flex', flexDirection:'column', gap:2 }}>
-                          {j.log.map((l, li) => (
+                          {log.map((l, li) => (
                             <div key={li} style={{ fontSize:11, color:'var(--text3)', fontFamily:'var(--mono)' }}>{l}</div>
                           ))}
                         </div>
-                        {j.status === 'cancelled' && (
-                          <div style={{ marginTop:10 }}>
-                            <Button
-                              size="sm"
-                              variant="secondary"
-                              disabled={running || rerunningIndex === i}
-                              onClick={() => rerunJob(i)}
-                            >
-                              {rerunningIndex === i
-                                ? <><Spinner size={12} /> Re-running…</>
-                                : <><i className="ti ti-refresh" style={{ fontSize:12 }} /> Re-run this job</>
-                              }
-                            </Button>
-                          </div>
-                        )}
                         <div style={{ marginTop:8 }}>
                           <a href={j.url} target="_blank" rel="noreferrer" style={{ fontSize:11, color:'var(--blue)', textDecoration:'none' }}>{j.url}</a>
                         </div>
@@ -947,7 +492,7 @@ export default function Dashboard() {
               <div className="empty-state">
                 <i className="ti ti-list" style={{ fontSize:32, opacity:.3 }} />
                 <div style={{ fontSize:14, fontWeight:500, marginTop:10 }}>No discovery log yet</div>
-                <div style={{ fontSize:12, color:'var(--text3)', marginTop:4 }}>Switch to autonomous mode to populate this log</div>
+                <div style={{ fontSize:12, color:'var(--text3)', marginTop:4 }}>Used in autonomous mode</div>
               </div>
             ) : (
               <Card style={{ padding:0, overflow:'hidden' }}>
