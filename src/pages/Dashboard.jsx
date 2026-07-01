@@ -44,6 +44,8 @@ export default function Dashboard() {
   const [sessionStatus, setSessionStatus] = useState('idle') // idle | waiting | polling | done
   const [openingTabs, setOpeningTabs]     = useState(false)
   const [copySuccess, setCopySuccess]     = useState(false)
+  const [blockedTabs, setBlockedTabs]     = useState([])
+  const [resumingTab, setResumingTab]     = useState(null)
   const pollIntervalRef = useRef(null)
   const jobsRef = useRef([])
 
@@ -85,7 +87,7 @@ export default function Dashboard() {
   // ── Start polling for live dashboard updates ──────────────
   function startPolling(sid) {
     setPolling(true)
-    setSessionStatus('polling')
+    setSessionStatus('running')
     if (pollIntervalRef.current) clearInterval(pollIntervalRef.current)
     pollIntervalRef.current = setInterval(async () => {
       try {
@@ -95,6 +97,7 @@ export default function Dashboard() {
         setJobs(newJobs)
         jobsRef.current = newJobs
         setClRows(newCLs)
+        setBlockedTabs(data.blockedTabs || [])
         setFilled(newJobs.filter(j => j.status === 'ready' || j.status === 'filled').length)
         refreshStats()
       } catch (_) {}
@@ -129,20 +132,18 @@ export default function Dashboard() {
     } catch (_) {}
   }
 
-  // ── Launch session with Claude ────────────────────────────
-  async function launchWithClaude() {
+  // ── Launch local Puppeteer session ─────────────────────────
+  async function launchSession() {
     if (launching) return
     setLaunching(true)
-    setJobs([]); setClRows([]); setFilled(0)
-    setSessionStatus('waiting')
+    setJobs([]); setClRows([]); setFilled(0); setBlockedTabs([])
+    setSessionStatus('running')
     try {
-      const result = await api.startSessionWithClaude({
+      const result = await api.startSession({
         urls: urlList, mode, cap,
         date: new Date().toLocaleDateString('en-US')
       })
       setSessionId(result.sessionId)
-      await navigator.clipboard.writeText(result.prompt)
-      window.open('https://claude.ai', '_blank')
       startPolling(result.sessionId)
     } catch (e) {
       alert('Failed to start session: ' + e.message)
@@ -150,6 +151,31 @@ export default function Dashboard() {
     } finally {
       setLaunching(false)
     }
+  }
+
+  // ── Resume a blocked tab after manual CAPTCHA resolution ──
+  async function resumeBlockedTab(url) {
+    setResumingTab(url)
+    try {
+      const result = await api.recheckTab(url)
+      if (result.blocked) {
+        alert('Still detecting a CAPTCHA or block on that tab. Please resolve it fully, then try Resume again.')
+      } else {
+        setBlockedTabs(prev => prev.filter(u => u !== url))
+      }
+    } catch (e) {
+      alert('Failed to resume tab: ' + e.message)
+    } finally {
+      setResumingTab(null)
+    }
+  }
+
+  // ── Close the browser session entirely ─────────────────────
+  async function endSession() {
+    if (!confirm('Close the Chrome window for this session? Any open application tabs will be closed.')) return
+    try { await api.closeSession() } catch (_) {}
+    stopPolling()
+    setBlockedTabs([])
   }
 
   const today = new Date().toLocaleDateString('en-US', { weekday:'long', month:'long', day:'numeric', year:'numeric' })
@@ -166,50 +192,62 @@ export default function Dashboard() {
           {!serverOk && <Badge type="danger"><i className="ti ti-alert-circle" /> Server offline</Badge>}
           {serverOk && !aiOk && <Badge type="warning"><i className="ti ti-alert-triangle" /> Add API key to .env</Badge>}
           {serverOk && aiOk && <Badge type="success"><i className="ti ti-circle-check" /> Claude API connected</Badge>}
-          {polling && <Badge type="info"><Spinner size={11} /> Waiting for Claude…</Badge>}
+          {polling && <Badge type="info"><Spinner size={11} /> Running in Chrome…</Badge>}
+          {blockedTabs.length > 0 && (
+            <Badge type="warning"><i className="ti ti-alert-triangle" /> {blockedTabs.length} tab{blockedTabs.length!==1?'s':''} need attention</Badge>
+          )}
           {sessionStatus === 'done' && <Badge type="success"><i className="ti ti-circle-check" /> Session complete</Badge>}
           <div className="mode-toggle" role="group">
             <button className={mode==='manual'?'active':''} onClick={() => setMode('manual')}>Manual</button>
             <button className={mode==='auto'?'active':''} onClick={() => setMode('auto')}>Autonomous</button>
           </div>
           {polling ? (
-            <Button variant="secondary" onClick={stopPolling} size="md">
-              <i className="ti ti-player-stop" style={{ fontSize:13 }} /> Stop polling
+            <Button variant="danger" onClick={endSession} size="md">
+              <i className="ti ti-player-stop" style={{ fontSize:13 }} /> Close session
             </Button>
           ) : (
-            <Button onClick={launchWithClaude} disabled={!canLaunch || launching} variant="primary">
+            <Button onClick={launchSession} disabled={!canLaunch || launching} variant="primary">
               {launching
-                ? <><Spinner size={13} /> Launching…</>
-                : <><i className="ti ti-brand-claude" /> Start session with Claude</>}
+                ? <><Spinner size={13} /> Launching Chrome…</>
+                : <><i className="ti ti-brand-chrome" /> Start session</>}
             </Button>
           )}
         </div>
       </div>
 
-      {/* Waiting for Claude banner */}
-      {sessionStatus === 'waiting' && (
-        <div className="carryover-banner" style={{ background:'var(--blue-bg)', borderColor:'rgba(96,165,250,.2)', marginBottom:16 }}>
-          <Spinner size={16} />
+      {/* Blocked tabs banner — CAPTCHA / bot-block detected, needs manual intervention */}
+      {blockedTabs.length > 0 && (
+        <div className="carryover-banner" style={{ background:'var(--red-bg)', borderColor:'rgba(248,113,113,.2)', marginBottom:16 }}>
+          <i className="ti ti-shield-exclamation" style={{ fontSize:16, color:'var(--red)' }} />
           <div style={{ flex:1 }}>
-            <div style={{ fontWeight:500, color:'var(--blue)' }}>Session prompt copied to clipboard — Claude.ai is opening</div>
+            <div style={{ fontWeight:500, color:'var(--red)' }}>{blockedTabs.length} tab{blockedTabs.length!==1?'s':''} blocked by CAPTCHA — waiting for you</div>
             <div style={{ fontSize:12, color:'var(--text2)', marginTop:2 }}>
-              Paste the prompt into the Claude chat and send it. This dashboard will update live as Claude processes each job.
+              Switch to the Chrome window, solve the CAPTCHA on each flagged tab, then click Resume below for each one.
+            </div>
+            <div style={{ display:'flex', flexDirection:'column', gap:6, marginTop:10 }}>
+              {blockedTabs.map(url => (
+                <div key={url} style={{ display:'flex', alignItems:'center', gap:8, fontSize:11 }}>
+                  <span style={{ flex:1, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', color:'var(--text2)' }}>{url}</span>
+                  <Button size="sm" variant="secondary" onClick={() => resumeBlockedTab(url)} disabled={resumingTab === url}>
+                    {resumingTab === url ? <Spinner size={11} /> : <><i className="ti ti-player-play" style={{ fontSize:11 }} /> Resume</>}
+                  </Button>
+                </div>
+              ))}
             </div>
           </div>
         </div>
       )}
 
-      {/* Polling banner */}
-      {sessionStatus === 'polling' && jobs.length === 0 && (
+      {/* Running banner */}
+      {sessionStatus === 'running' && jobs.length === 0 && (
         <div className="carryover-banner" style={{ background:'var(--blue-bg)', borderColor:'rgba(96,165,250,.2)', marginBottom:16 }}>
           <Spinner size={16} />
           <div style={{ flex:1 }}>
-            <div style={{ fontWeight:500, color:'var(--blue)' }}>Waiting for Claude to start processing jobs…</div>
+            <div style={{ fontWeight:500, color:'var(--blue)' }}>Chrome window opening — processing your job list…</div>
             <div style={{ fontSize:12, color:'var(--text2)', marginTop:2 }}>
-              Dashboard updates every 3 seconds. Make sure you pasted and sent the prompt in Claude.ai.
+              A visible Chrome window will appear. Dashboard updates every 3 seconds as jobs are processed.
             </div>
           </div>
-          <Button size="sm" variant="secondary" onClick={stopPolling}>Stop waiting</Button>
         </div>
       )}
 
@@ -367,10 +405,10 @@ export default function Dashboard() {
               <div style={{ display:'flex', flexDirection:'column', gap:8, fontSize:12, color:'var(--text2)', lineHeight:1.7 }}>
                 <div><span style={{ color:'var(--purple)', fontWeight:600 }}>1.</span> Upload your resume and cover letter template in the sidebar</div>
                 <div><span style={{ color:'var(--purple)', fontWeight:600 }}>2.</span> Paste your job URLs (one per line) in the sidebar</div>
-                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>3.</span> Click <strong>Start session with Claude</strong> — this copies a prompt and opens claude.ai</div>
-                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>4.</span> Paste the prompt into Claude chat and send it</div>
-                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>5.</span> Watch this dashboard update live as Claude processes each job</div>
-                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>6.</span> When done, review the Ready to Apply panel and open all tabs</div>
+                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>3.</span> Click <strong>Start session</strong> — a visible Chrome window opens automatically</div>
+                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>4.</span> Watch this dashboard update live as each job is scraped, scored, and filtered</div>
+                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>5.</span> If a CAPTCHA appears, solve it in the Chrome window then click Resume here</div>
+                <div><span style={{ color:'var(--purple)', fontWeight:600 }}>6.</span> Qualifying applications open automatically — review and submit manually</div>
               </div>
             </Card>
           )}
@@ -385,13 +423,13 @@ export default function Dashboard() {
                     {readyJobs.length} application{readyJobs.length!==1?'s':''} ready to apply
                   </div>
                   <div style={{ fontSize:12, color:'var(--text2)', marginTop:3 }}>
-                    Open all tabs, then come back to this chat and say "Fill all open application tabs"
+                    These application tabs are already open in your Chrome window — review and submit manually
                   </div>
                 </div>
                 <Button size="sm" variant="secondary" onClick={openAllTabs} disabled={openingTabs}>
                   {openingTabs
                     ? <><Spinner size={12} /> Opening…</>
-                    : <><i className="ti ti-external-link" style={{ fontSize:12 }} /> Open all tabs</>}
+                    : <><i className="ti ti-external-link" style={{ fontSize:12 }} /> Re-open tabs in browser</>}
                 </Button>
               </div>
               <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
@@ -437,7 +475,7 @@ export default function Dashboard() {
                   <i className="ti ti-search" style={{ fontSize:32, opacity:.3 }} />
                   <div style={{ fontSize:14, fontWeight:500, marginTop:10 }}>No jobs yet</div>
                   <div style={{ fontSize:12, color:'var(--text3)', marginTop:4 }}>
-                    {!resumeName ? 'Upload your resume to get started' : 'Start a session with Claude to process jobs'}
+                    {!resumeName ? 'Upload your resume to get started' : 'Click Start session to begin'}
                   </div>
                 </div>
               ) : (

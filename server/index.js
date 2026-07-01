@@ -3,6 +3,7 @@ const cors = require('cors')
 const path = require('path')
 const fs = require('fs')
 const https = require('https')
+const puppeteerService = require('./puppeteer-service')
 
 const app = express()
 const PORT = 3001
@@ -390,25 +391,27 @@ app.post('/api/chrome/generate-fill-instructions', async (req, res) => {
   try {
     // Get Q&A bank
     const pairs = queryAll(`
-      SELECT qa_pairs.*, qa_categories.name as category_name 
-      FROM qa_pairs JOIN qa_categories ON qa_pairs.category_id = qa_categories.id
+      SELECT qa_pairs.*, qa_categories.name as category_name
+      FROM qa_pairs
+             JOIN qa_categories ON qa_pairs.category_id = qa_categories.id
     `)
 
     // Background check keywords for auto-approve logic
-    const bgKeywords = ['background check','authorized to work','work authorization',
-      'sponsorship','felony','criminal','drug test','convicted','eligible to work']
-    const aiKeywords = ['are you an ai','are you ai','are you a bot','are you human',
-      'was this filled by ai','did you use ai','ai assistance','artificial intelligence',
-      'automated application','confirm you are human']
+    const bgKeywords = ['background check', 'authorized to work', 'work authorization',
+      'sponsorship', 'felony', 'criminal', 'drug test', 'convicted', 'eligible to work']
+    const aiKeywords = ['are you an ai', 'are you ai', 'are you a bot', 'are you human',
+      'was this filled by ai', 'did you use ai', 'ai assistance', 'artificial intelligence',
+      'automated application', 'confirm you are human']
 
     const result = await claudeRequest(
-      [{ role: 'user', content:
-        `Resume:\n${resume_text}\n\n` +
-        `Job: ${job_title} at ${company}\n\n` +
-        `Q&A Bank:\n${JSON.stringify(pairs.map(p => ({ q: p.question, a: p.answer, cat: p.category_name })))}\n\n` +
-        `Form fields to fill:\n${JSON.stringify(form_fields)}`
-      }],
-      `You are a job application assistant. Generate fill instructions for each form field.
+        [{
+          role: 'user', content:
+              `Resume:\n${resume_text}\n\n` +
+              `Job: ${job_title} at ${company}\n\n` +
+              `Q&A Bank:\n${JSON.stringify(pairs.map(p => ({q: p.question, a: p.answer, cat: p.category_name})))}\n\n` +
+              `Form fields to fill:\n${JSON.stringify(form_fields)}`
+        }],
+        `You are a job application assistant. Generate fill instructions for each form field.
       Use the resume for personal info (name, email, phone, address, work history, education, skills).
       Use the Q&A bank for application questions.
       For select/radio/checkbox fields, pick the best matching option.
@@ -446,31 +449,29 @@ app.post('/api/chrome/generate-fill-instructions', async (req, res) => {
     )
 
     const parsed = parseJSON(result)
-    if (!parsed) return res.status(500).json({ error: 'Could not generate fill instructions' })
+    if (!parsed) return res.status(500).json({error: 'Could not generate fill instructions'})
 
     // Log all instructions to qa_match_log
     for (const inst of (parsed.instructions || [])) {
       db.run(`
-        INSERT INTO qa_match_log(
-          job_id, session_id, application_question, matched_question, matched_answer,
-          confidence, category_name, question_type, available_options, selected_option,
-          is_background_check, is_ai_detection, was_skipped, needs_review
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [
-          job_id || null, session_id || null,
-          inst.field_label, inst.matched_qa_question, inst.value,
-          inst.confidence, inst.source,
-          inst.field_type,
-          inst.available_options ? JSON.stringify(inst.available_options) : null,
-          inst.value,
-          inst.is_background_check ? 1 : 0,
-          inst.is_ai_detection ? 1 : 0,
-          inst.skip ? 1 : 0,
-          inst.needs_review ? 1 : 0
-        ]
+            INSERT INTO qa_match_log(job_id, session_id, application_question, matched_question, matched_answer,
+                                     confidence, category_name, question_type, available_options, selected_option,
+                                     is_background_check, is_ai_detection, was_skipped, needs_review)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [
+            job_id || null, session_id || null,
+            inst.field_label, inst.matched_qa_question, inst.value,
+            inst.confidence, inst.source,
+            inst.field_type,
+            inst.available_options ? JSON.stringify(inst.available_options) : null,
+            inst.value,
+            inst.is_background_check ? 1 : 0,
+            inst.is_ai_detection ? 1 : 0,
+            inst.skip ? 1 : 0,
+            inst.needs_review ? 1 : 0
+          ]
       )
     }
-    saveDB()
 
     // Build summary counts for dashboard
     const summary = {
@@ -481,6 +482,7 @@ app.post('/api/chrome/generate-fill-instructions', async (req, res) => {
       ai_detections: parsed.instructions?.filter(i => i.is_ai_detection).length || 0,
     }
 
+    saveDB()
     res.json({ instructions: parsed.instructions, summary })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
@@ -1138,190 +1140,359 @@ app.get('/api/session-summary/:session_id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-// ── Claude-driven session endpoints ──────────────────────
+// ── Puppeteer-driven session endpoints ────────────────────
 
-// Ping — lets Claude verify the server is reachable before starting
+// Ping — confirms the server is reachable
 app.get('/api/session/ping', (req, res) => {
   res.json({ ok: true, port: PORT, timestamp: new Date().toISOString() })
 })
 
-// Start a Claude-driven session — creates session, returns full prompt for Claude chat
-app.post('/api/session/start-with-claude', async (req, res) => {
+// Start a local Puppeteer session — launches visible Chrome and begins processing
+app.post('/api/session/start', async (req, res) => {
   const { urls, mode, cap, date } = req.body
   try {
-    // Create session in DB
     const sessionInfo = run(
       'INSERT INTO sessions(date, mode, cap) VALUES(?,?,?)',
       [date || new Date().toLocaleDateString('en-US'), mode || 'manual', cap || 7]
     )
     const sessionId = sessionInfo.lastInsertRowid
 
-    // Load resume and cover letter base64
-    const resumeRow = queryAll('SELECT file_name, file_data FROM stored_files WHERE type=?', ['resume'])[0]
-    const clRow     = queryAll('SELECT file_name, file_data FROM stored_files WHERE type=?', ['cover_letter'])[0]
+    await puppeteerService.launchSession(sessionId)
 
-    // Load Q&A bank grouped by category
-    const pairs = queryAll(`
-      SELECT qa_pairs.question, qa_pairs.answer, qa_categories.name as category
-      FROM qa_pairs JOIN qa_categories ON qa_pairs.category_id = qa_categories.id
-      ORDER BY qa_categories.sort_order, qa_pairs.id
-    `)
-    const qaByCategory = {}
-    for (const p of pairs) {
-      if (!qaByCategory[p.category]) qaByCategory[p.category] = []
-      qaByCategory[p.category].push({ q: p.question, a: p.answer })
-    }
+    // Respond immediately — actual processing happens async via runSessionAsync
+    res.json({ ok: true, sessionId })
 
-    // Load preferences for context
-    const prefRows = queryAll('SELECT key, value FROM preferences')
-    const prefs = {}
-    prefRows.forEach(r => { prefs[r.key] = JSON.parse(r.value) })
-
-    // Build the Claude prompt
-    const prompt = buildClaudePrompt({
-      sessionId,
-      urls,
-      cap,
-      resumeName: resumeRow?.file_name,
-      hasResume: !!resumeRow,
-      hasResumePdf: !!resumeRow?.file_data,
-      clName: clRow?.file_name,
-      hasCL: !!clRow,
-      qaByCategory,
-      prefs,
-      serverPort: PORT
+    // Kick off background processing (do not await — let it run independently)
+    runSessionAsync(sessionId, urls || [], mode || 'manual', cap || 7).catch(err => {
+      console.error('Session processing error:', err.message)
     })
 
-    res.json({ sessionId, prompt, ok: true })
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-function buildClaudePrompt({ sessionId, urls, cap, resumeName, hasResume, hasResumePdf, clName, hasCL, qaByCategory, prefs, serverPort }) {
-  const urlList = (urls || []).map((u, i) => `${i + 1}. ${u}`).join('\n')
-  const qaText  = Object.entries(qaByCategory).map(([cat, pairs]) =>
-    `### ${cat}\n${pairs.map(p => `Q: ${p.q}\nA: ${p.a}`).join('\n\n')}`
-  ).join('\n\n')
+// Background job processor — runs the full pipeline per URL using Puppeteer
+async function runSessionAsync(sessionId, urls, mode, cap) {
+  const resumeRow = queryAll('SELECT file_data FROM stored_files WHERE type=?', ['resume'])[0]
+  const clRow     = queryAll('SELECT file_data FROM stored_files WHERE type=?', ['cover_letter'])[0]
 
-  return `# Job Application Session Request
-Session ID: ${sessionId}
-Dashboard server: http://localhost:${serverPort}
-
-## What I need you to do
-I am running a job application agent. Please use Claude in Chrome to process each job URL below by:
-
-1. Opening each URL in a **dedicated Chrome window** (keep all tabs in one window)
-2. Reading the full page content to extract the job title, company, description, requirements, and posting date
-3. For each job, POST the extracted data to my local server so the dashboard updates live:
-   \`\`\`
-   POST http://localhost:${serverPort}/api/session/job-update
-   \`\`\`
-4. Running these checks using the Anthropic API (you already have access):
-   - **Resume match** — score 0-100 against the job description (70+ passes)
-   - **Legitimacy** — flag scam signals
-   - **Posting age** — skip if posted more than 30 days ago
-   - **Layoffs** — web search for recent layoffs at the company (last 6 months)
-5. For jobs that pass ALL filters (and within the daily cap of ${cap}):
-   - Open the application page
-   - Fill out the form using my resume and Q&A answers below
-   - Leave the tab open — do NOT submit
-   - POST the result back to my server
-6. After all jobs are processed, POST the session complete status:
-   \`\`\`
-   POST http://localhost:${serverPort}/api/session/complete
-   { "session_id": ${sessionId} }
-   \`\`\`
-
-## Important rules
-- Never submit any application — always leave tabs open for my review
-- If any question asks "are you AI / human / a bot" — leave it blank and log it
-- For multiple choice background check questions (work auth, felony, drug test) — auto-answer from Q&A bank
-- For other multiple choice with confidence ≥85% — auto-select and log
-- For other multiple choice with confidence <85% — flag for my review, still make best guess
-- Post progress updates to my server after each job so my dashboard updates in real time
-
-## Job URLs to process
-${urlList}
-
-## My resume
-File: ${resumeName || 'Not uploaded'}
-${hasResume ? '(Extract text from my resume PDF stored in the dashboard database — call GET http://localhost:' + serverPort + '/api/files/resume to get the base64 PDF)' : '⚠️ No resume uploaded — please ask me to upload one first'}
-
-## My cover letter template
-${hasCL ? `File: ${clName}\n(Call GET http://localhost:${serverPort}/api/files/cover_letter for the base64 PDF)` : 'No cover letter template uploaded — skip cover letter generation'}
-
-## My Q&A bank
-${qaText || 'No Q&A entries yet'}
-
-## API format for posting job updates
-\`\`\`json
-POST http://localhost:${serverPort}/api/session/job-update
-{
-  "session_id": ${sessionId},
-  "url": "the job url",
-  "title": "job title",
-  "company": "company name",
-  "board": "Manual",
-  "score": 85,
-  "filter_match": true,
-  "filter_legit": true,
-  "filter_age": true,
-  "filter_layoffs": true,
-  "status": "ready",
-  "log": ["✓ Score 85%", "✓ Legitimate", "✓ Posted 5 days ago", "✓ No layoffs found"],
-  "cover_letter_text": "full cover letter text or null",
-  "cover_letter_filename": "Company_062326_CL.pdf or null"
-}
-\`\`\`
-`
-}
-
-// Receive live job updates from Claude during a session
-app.post('/api/session/job-update', (req, res) => {
-  const {
-    session_id, url, title, company, board, score,
-    filter_match, filter_legit, filter_age, filter_layoffs,
-    status, log, cover_letter_text, cover_letter_filename, carryover
-  } = req.body
-
-  try {
-    const discovered_at = new Date().toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit' })
-    const info = run(
-      `INSERT INTO jobs(session_id,title,company,board,url,query,discovered_at,score,filter_match,filter_legit,filter_age,filter_layoffs,status,log,carryover)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [session_id, title||'Position', company||'Unknown', board||'Manual', url, '',
-       discovered_at, score||0,
-       filter_match?1:0, filter_legit?1:0, filter_age?1:0,
-       filter_layoffs===null||filter_layoffs===undefined?null:(filter_layoffs?1:0),
-       status||'pending', JSON.stringify(log||[]), carryover?1:0]
-    )
-
-    // Save cover letter if provided
-    if (cover_letter_text && cover_letter_filename) {
-      run(
-        `INSERT INTO cover_letters(session_id,job_id,company,file_name,file_path,board,application_url) VALUES(?,?,?,?,?,?,?)`,
-        [session_id, info.lastInsertRowid, company, cover_letter_filename,
-         cover_letter_filename, board||'Manual', url]
+  let resumeText = ''
+  if (resumeRow?.file_data) {
+    try {
+      const extracted = await claudeRequest(
+        [{ role: 'user', content: [
+          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: resumeRow.file_data } },
+          { type: 'text', text: 'Extract all text from this resume.' }
+        ]}],
+        'Extract and return the complete text content from the PDF. Return only the extracted text.'
       )
+      resumeText = extracted.trim()
+    } catch (_) {}
+  }
+
+  let filled = 0
+  const blockedUrls = []
+
+  for (const url of urls) {
+    if (!puppeteerService.isSessionActive(sessionId)) break // session was cancelled/closed
+
+    const jobLog = []
+    const board = mode === 'auto' ? 'Searching' : 'Manual'
+    const ts = new Date().toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit' })
+
+    // ── Domain check first ──────────────────────────────────
+    let domain
+    try { domain = new URL(url).hostname.replace(/^www\./, '') } catch (_) { domain = url }
+
+    const domainCheck = await checkDomainInternal(url)
+    if (!domainCheck.proceed) {
+      jobLog.push(`✗ Domain "${domain}" blocked: ${domainCheck.reason || domainCheck.status}`)
+      run(
+        `INSERT INTO jobs(session_id,title,company,board,url,query,discovered_at,score,filter_match,filter_legit,filter_age,filter_layoffs,status,log,carryover)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [sessionId, 'Position', domain, board, url, '', ts, 0, 0, null, null, null, 'skip', JSON.stringify(jobLog), 0]
+      )
+      continue
     }
 
-    // Update session totals
-    const sessionJobs = queryAll('SELECT * FROM jobs WHERE session_id=?', [session_id])
-    const found   = sessionJobs.length
-    const matched = sessionJobs.filter(j => j.filter_match).length
-    const filled  = sessionJobs.filter(j => j.status === 'ready' || j.status === 'filled').length
-    db.run('UPDATE sessions SET jobs_found=?,jobs_matched=?,jobs_filled=? WHERE id=?',
-      [found, matched, filled, session_id])
-    saveDB()
+    // ── Scrape the page ──────────────────────────────────────
+    jobLog.push('→ Opening job page in Chrome…')
+    let scrapeResult
+    try {
+      scrapeResult = await puppeteerService.scrapeUrl(url)
+    } catch (e) {
+      jobLog.push(`✗ Failed to load page: ${e.message}`)
+      run(
+        `INSERT INTO jobs(session_id,title,company,board,url,query,discovered_at,score,filter_match,filter_legit,filter_age,filter_layoffs,status,log,carryover)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [sessionId, 'Position', domain, board, url, '', ts, 0, 0, null, null, null, 'skip', JSON.stringify(jobLog), 0]
+      )
+      continue
+    }
 
-    res.json({ ok: true, job_id: info.lastInsertRowid })
+    if (scrapeResult.blocked) {
+      jobLog.push('⚠ CAPTCHA or bot-block detected — tab left open for manual review')
+      blockedUrls.push(url)
+      run(
+        `INSERT INTO jobs(session_id,title,company,board,url,query,discovered_at,score,filter_match,filter_legit,filter_age,filter_layoffs,status,log,carryover)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [sessionId, 'Position (blocked)', domain, board, url, '', ts, 0, null, null, null, null, 'blocked', JSON.stringify(jobLog), 0]
+      )
+      continue
+    }
+
+    // Register this domain visit
+    recordDomainVisit(domain)
+
+    // ── Extract structured job data ───────────────────────────
+    jobLog.push('→ Extracting job details…')
+    let jobData = {}
+    try {
+      const result = await claudeRequest(
+        [{ role: 'user', content: `URL: ${url}\n\nPage content:\n${scrapeResult.text.slice(0, 8000)}` }],
+        `Extract structured data from this job posting page. Respond ONLY with JSON:
+        { "title": "...", "company": "...", "description": "...", "posted_date": "...", "days_old": <int|null>, "within_30_days": <true|false|null>, "apply_url": "url or null" }
+        If not a job posting, set title to null.`
+      )
+      jobData = parseJSON(result) || {}
+    } catch (_) {}
+
+    const jobTitle = jobData.title || scrapeResult.title || 'Position'
+    const company  = jobData.company || domain.split('.')[0]
+    const jobDesc  = jobData.description || scrapeResult.text.slice(0, 4000)
+
+    // ── Resume match ───────────────────────────────────────────
+    let score = 0, matchPass = false
+    try {
+      const matchResult = await claudeRequest(
+        [{ role: 'user', content: `Resume:\n${resumeText}\n\nJob Title: ${jobTitle} at ${company}\nJob Description:\n${jobDesc}` }],
+        `Score how well the resume matches the job. Respond ONLY with JSON: { "score": <0-100>, "strengths": ["..."], "missing": ["..."] }`
+      )
+      const parsed = parseJSON(matchResult)
+      score = parsed?.score ?? 0
+      matchPass = score >= 70
+      jobLog.push(matchPass ? `✓ Score ${score}% — above threshold` : `✗ Score ${score}% — below 70% threshold`)
+    } catch (e) { jobLog.push(`⚠ Match check failed: ${e.message}`) }
+
+    if (!matchPass) {
+      run(
+        `INSERT INTO jobs(session_id,title,company,board,url,query,discovered_at,score,filter_match,filter_legit,filter_age,filter_layoffs,status,log,carryover)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [sessionId, jobTitle, company, board, url, '', ts, score, 0, null, null, null, 'skip', JSON.stringify(jobLog), 0]
+      )
+      continue
+    }
+
+    // ── Legitimacy ───────────────────────────────────────────
+    let legitPass = true
+    try {
+      const legitResult = await claudeRequest(
+        [{ role: 'user', content: `Job Title: ${jobTitle}\nCompany: ${company}\nURL: ${url}\nJob Description:\n${jobDesc}` }],
+        `Analyze this job posting for scam signals. Respond ONLY with JSON: { "legitimate": <true|false>, "flags": ["..."] }`
+      )
+      const parsed = parseJSON(legitResult)
+      legitPass = parsed?.legitimate !== false
+      jobLog.push(legitPass ? '✓ Legitimate posting' : `✗ Scam signals: ${parsed?.flags?.join(', ')}`)
+    } catch (_) { jobLog.push('⚠ Legitimacy check failed — proceeding') }
+
+    if (!legitPass) {
+      run(
+        `INSERT INTO jobs(session_id,title,company,board,url,query,discovered_at,score,filter_match,filter_legit,filter_age,filter_layoffs,status,log,carryover)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [sessionId, jobTitle, company, board, url, '', ts, score, 1, 0, null, null, 'skip', JSON.stringify(jobLog), 0]
+      )
+      continue
+    }
+
+    // ── Posting age ───────────────────────────────────────────
+    let agePass = jobData.within_30_days !== false
+    jobLog.push(agePass ? '✓ Posting age OK' : `✗ Posted ${jobData.days_old} days ago — exceeds 30-day limit`)
+
+    if (!agePass) {
+      run(
+        `INSERT INTO jobs(session_id,title,company,board,url,query,discovered_at,score,filter_match,filter_legit,filter_age,filter_layoffs,status,log,carryover)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [sessionId, jobTitle, company, board, url, '', ts, score, 1, 1, 0, null, 'skip', JSON.stringify(jobLog), 0]
+      )
+      continue
+    }
+
+    // ── Layoffs ───────────────────────────────────────────────
+    let layoffPass = true
+    try {
+      const layoffResult = await claudeRequest(
+        [{ role: 'user', content: `Search for recent layoffs at "${company}" in the last 6 months.` }],
+        `Check for significant layoffs in the last 6 months. Respond ONLY with JSON: { "had_layoffs": <true|false>, "details": "..." }`,
+        true
+      )
+      const parsed = parseJSON(layoffResult)
+      layoffPass = !parsed?.had_layoffs
+      jobLog.push(layoffPass ? '✓ No recent layoffs found' : `✗ Layoffs found: ${parsed?.details}`)
+    } catch (_) { jobLog.push('⚠ Layoff check failed — proceeding') }
+
+    if (!layoffPass) {
+      run(
+        `INSERT INTO jobs(session_id,title,company,board,url,query,discovered_at,score,filter_match,filter_legit,filter_age,filter_layoffs,status,log,carryover)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [sessionId, jobTitle, company, board, url, '', ts, score, 1, 1, 1, 0, 'skip', JSON.stringify(jobLog), 0]
+      )
+      continue
+    }
+
+    // ── Daily cap check ─────────────────────────────────────
+    if (filled >= cap) {
+      jobLog.push(`⏸ Daily cap of ${cap} reached — added to carry-over`)
+      run(
+        `INSERT INTO jobs(session_id,title,company,board,url,query,discovered_at,score,filter_match,filter_legit,filter_age,filter_layoffs,status,log,carryover)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [sessionId, jobTitle, company, board, url, '', ts, score, 1, 1, 1, 1, 'carryover', JSON.stringify(jobLog), 1]
+      )
+      continue
+    }
+
+    // ── All filters passed — open application tab ────────────
+    filled++
+    jobLog.push('✓ All checks passed — opening application tab for your review')
+    try {
+      const applyUrl = jobData.apply_url || url
+      await puppeteerService.openApplicationTab(applyUrl)
+    } catch (e) {
+      jobLog.push(`⚠ Could not open application tab: ${e.message}`)
+    }
+
+    const jobRecord = run(
+      `INSERT INTO jobs(session_id,title,company,board,url,query,discovered_at,score,filter_match,filter_legit,filter_age,filter_layoffs,status,log,carryover)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [sessionId, jobTitle, company, board, url, '', ts, score, 1, 1, 1, 1, 'ready', JSON.stringify(jobLog), 0]
+    )
+
+    // ── Cover letter (text generation only — Stage 1 doesn't write the PDF file) ──
+    if (clRow?.file_data) {
+      try {
+        const clExtracted = await claudeRequest(
+          [{ role: 'user', content: [
+            { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: clRow.file_data } },
+            { type: 'text', text: 'Extract all text from this cover letter template.' }
+          ]}],
+          'Extract and return the complete text content from the PDF.'
+        )
+        const clResult = await claudeRequest(
+          [{ role: 'user', content: `Template:\n${clExtracted}\n\nResume:\n${resumeText}\n\nJob: ${jobTitle} at ${company}\nDescription:\n${jobDesc}` }],
+          `Write a customized cover letter using the template as a style guide. Return only the cover letter text.`
+        )
+        const dateStr = new Date().toLocaleDateString('en-US',{month:'2-digit',day:'2-digit',year:'2-digit'}).replace(/\//g,'')
+        const companyClean = company.charAt(0).toUpperCase() + company.slice(1)
+        const fileName = `${companyClean}_${dateStr}_CL.pdf`
+        run(
+          `INSERT INTO cover_letters(session_id,job_id,company,file_name,file_path,board,application_url) VALUES(?,?,?,?,?,?,?)`,
+          [sessionId, jobRecord.lastInsertRowid, company, fileName, fileName, board, url]
+        )
+      } catch (_) {}
+    }
+
+    // Update session totals after each job
+    const sessionJobs = queryAll('SELECT * FROM jobs WHERE session_id=?', [sessionId])
+    db.run('UPDATE sessions SET jobs_found=?,jobs_matched=?,jobs_filled=? WHERE id=?',
+      [sessionJobs.length, sessionJobs.filter(j=>j.filter_match).length, sessionJobs.filter(j=>j.status==='ready').length, sessionId])
+    saveDB()
+  }
+
+  // After the URL list is exhausted, return to any blocked tabs for manual intervention
+  // (the tabs are already open in the browser — nothing more to do here automatically;
+  // the user resolves them via the dashboard's "Resume" flow)
+}
+
+// Helper — call the domain check logic internally (reuses the same function as the API route)
+async function checkDomainInternal(url) {
+  let domain
+  try { domain = new URL(url).hostname.replace(/^www\./, '') } catch (_) { domain = url }
+
+  let existing = queryAll('SELECT * FROM domain_registry WHERE domain=?', [domain])[0]
+
+  if (!existing) {
+    const blacklistedDomains = queryAll("SELECT domain, reason FROM domain_registry WHERE status='blacklisted'")
+    const rootMatch = matchesBlacklistedRoot(domain, blacklistedDomains.map(d => d.domain))
+    if (rootMatch) {
+      const parentEntry = blacklistedDomains.find(d => d.domain === rootMatch)
+      db.run(
+        `INSERT OR IGNORE INTO domain_registry(domain, status, reason, source, created_at)
+         VALUES(?, 'blacklisted', ?, 'inherited', datetime('now','localtime'))`,
+        [domain, `Subdomain of blacklisted root "${rootMatch}": ${parentEntry?.reason || ''}`]
+      )
+      saveDB()
+      return { domain, status: 'blacklisted', proceed: false, reason: `Subdomain of blacklisted domain "${rootMatch}"` }
+    }
+  }
+
+  if (existing) {
+    if (existing.status === 'blacklisted') return { domain, status: 'blacklisted', proceed: false, reason: existing.reason }
+    if (existing.status === 'whitelisted') return { domain, status: 'whitelisted', proceed: true }
+    if (existing.status === 'pending')     return { domain, status: 'pending', proceed: false, reason: 'Awaiting manual ToS review' }
+  }
+
+  // New domain — try ToS check
+  const tos = await findTosPage(domain)
+  if (!tos) {
+    db.run(`INSERT OR IGNORE INTO domain_registry(domain, status, source) VALUES(?, 'pending', 'auto')`, [domain])
+    saveDB()
+    return { domain, status: 'pending', proceed: false, reason: 'No ToS page found — needs manual review' }
+  }
+
+  try {
+    const result = await claudeRequest(
+      [{ role: 'user', content: `Terms of Service content (truncated):\n${tos.body.replace(/<[^>]+>/g, ' ').slice(0, 6000)}` }],
+      `Determine if this ToS prohibits bots/scraping. Respond ONLY with JSON: { "prohibits_bots": true|false, "clause": "..." }`
+    )
+    const parsed = parseJSON(result)
+    if (parsed?.prohibits_bots === true) {
+      db.run(
+        `INSERT OR REPLACE INTO domain_registry(domain, status, reason, tos_url, tos_clause, source, created_at)
+         VALUES(?, 'blacklisted', ?, ?, ?, 'auto', datetime('now','localtime'))`,
+        [domain, 'Auto-detected: ToS prohibits bots/scraping', tos.url, parsed.clause || '']
+      )
+      saveDB()
+      return { domain, status: 'blacklisted', proceed: false, reason: parsed.clause }
+    } else {
+      db.run(
+        `INSERT OR REPLACE INTO domain_registry(domain, status, tos_url, source, visit_count, first_visited_at, last_visited_at, created_at)
+         VALUES(?, 'whitelisted', ?, 'auto', 0, datetime('now','localtime'), datetime('now','localtime'), datetime('now','localtime'))`,
+        [domain, tos.url]
+      )
+      saveDB()
+      return { domain, status: 'whitelisted', proceed: true }
+    }
+  } catch (e) {
+    // If ToS check itself fails, treat as pending rather than blocking silently
+    db.run(`INSERT OR IGNORE INTO domain_registry(domain, status, source) VALUES(?, 'pending', 'auto')`, [domain])
+    saveDB()
+    return { domain, status: 'pending', proceed: false, reason: 'ToS analysis failed — needs manual review' }
+  }
+}
+
+function recordDomainVisit(domain) {
+  db.run('UPDATE domain_registry SET visit_count=visit_count+1, jobs_found_total=jobs_found_total+1, last_visited_at=datetime(\'now\',\'localtime\') WHERE domain=?', [domain])
+  saveDB()
+}
+
+// Get list of tabs currently blocked (CAPTCHA) and waiting for manual review
+app.get('/api/session/blocked-tabs', (req, res) => {
+  res.json({ blockedUrls: puppeteerService.getBlockedTabs() })
+})
+
+// Re-check a blocked tab after the user has manually resolved a CAPTCHA
+app.post('/api/session/recheck-tab', async (req, res) => {
+  const { url } = req.body
+  try {
+    const result = await puppeteerService.recheckBlockedTab(url)
+    res.json(result)
   } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
-// Mark session as complete
-app.post('/api/session/complete', (req, res) => {
-  const { session_id } = req.body
-  // Nothing extra needed — just acknowledge so Claude knows it's done
-  res.json({ ok: true, session_id })
+// Close the active browser session
+app.post('/api/session/close', async (req, res) => {
+  try {
+    await puppeteerService.closeSession()
+    res.json({ ok: true })
+  } catch (e) { res.status(500).json({ error: e.message }) }
 })
 
 // Poll for session jobs — dashboard calls this to get live updates
@@ -1334,7 +1505,7 @@ app.get('/api/session/jobs/:session_id', (req, res) => {
     'SELECT * FROM cover_letters WHERE session_id=?',
     [req.params.session_id]
   )
-  res.json({ jobs, cover_letters: cls })
+  res.json({ jobs, cover_letters: cls, blockedTabs: puppeteerService.getBlockedTabs() })
 })
 
 // ── Stats ─────────────────────────────────────────────────

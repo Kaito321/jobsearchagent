@@ -80,10 +80,13 @@ export const getReadyJobs          = (params) => api.get('/jobs/ready', { params
 export const markJobSubmitted      = (id) => api.patch(`/jobs/${id}/submit`).then(r => r.data)
 export const getSessionSummary     = (sessionId) => api.get(`/session-summary/${sessionId}`).then(r => r.data)
 
-// ── Claude-driven session ─────────────────────────────────
-export const pingServer            = () => api.get('/session/ping').then(r => r.data)
-export const startSessionWithClaude = (data) => api.post('/session/start-with-claude', data).then(r => r.data)
-export const pollSessionJobs       = (sessionId) => api.get(`/session/jobs/${sessionId}`).then(r => r.data)
+// ── Puppeteer-driven session ───────────────────────────────
+export const pingServer       = () => api.get('/session/ping').then(r => r.data)
+export const startSession     = (data) => api.post('/session/start', data).then(r => r.data)
+export const pollSessionJobs  = (sessionId) => api.get(`/session/jobs/${sessionId}`).then(r => r.data)
+export const getBlockedTabs   = () => api.get('/session/blocked-tabs').then(r => r.data)
+export const recheckTab       = (url) => api.post('/session/recheck-tab', { url }).then(r => r.data)
+export const closeSession     = () => api.post('/session/close').then(r => r.data)
 
 // ── Domain management ──────────────────────────────────────
 export const checkDomain        = (url) => api.post('/domain/check', { url }).then(r => r.data)
